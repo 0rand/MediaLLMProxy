@@ -43,15 +43,19 @@ model receives a terse observation instead of media it cannot see.
   `publish` mode of `build.sh` produces a self-contained single-file binary
   with **no runtime required at all** on the target machine.
 
-**One manual prerequisite — .NET 10 SDK:**
+**One manual prerequisite — .NET 10 SDK — and even that is handled for you:**
 
-| Platform | Install |
-|---|---|
-| Linux | `curl -fsSL https://dot.net/v1/dotnet-install.sh \| bash -s -- --channel 10.0` (or distro packages: `apt install dotnet-sdk-10.0`) |
-| macOS | `brew install --cask dotnet-sdk` or the dotnet-install.sh above |
-| Windows | `winget install Microsoft.DotNet.SDK.10` |
+- `build.sh` (Linux/macOS) is **self-bootstrapping**: if `dotnet` is missing it
+  installs the .NET 10 SDK locally into `~/.dotnet` (no sudo, no admin) via
+  dotnet-install.sh and continues. Set `AUTO_INSTALL_DOTNET=0` to disable.
+- `build.ps1` (Windows) tries `winget install Microsoft.DotNet.SDK.10`
+  automatically when `dotnet` is missing; pass `-SkipSdkInstall` for manual setup.
+- Manual, if you prefer:
+  - Linux: `curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0`
+  - macOS: `brew install --cask dotnet-sdk` (or the same dotnet-install.sh)
+  - Windows: `winget install Microsoft.DotNet.SDK.10`
 
-`build.sh` checks for `dotnet` and fails with a clear message if it's missing.
+So the honest onboarding is: **`git clone` → `./build.sh` → running.**
 
 **Bring your own (not shipped):** the text model and vision model endpoints.
 Any OpenAI-compatible server — vLLM, oMLX, Ollama, llama.cpp, LM Studio —
