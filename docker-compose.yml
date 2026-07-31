@@ -1,0 +1,16 @@
+# MediaLLMProxy — example compose: proxy + a vision sidecar (ollama)
+# Text backend is your own; point it anywhere OpenAI-compatible.
+services:
+  mediabridge:
+    build: .
+    container_name: mediabridge
+    ports:
+      - "7071:7071"
+    environment:
+      RoutingOptions__PrimaryBackend__BaseUrl: "http://host.docker.internal:8000"
+      RoutingOptions__PrimaryBackend__RewriteModel: "your-text-model"
+      RoutingOptions__PrimaryBackend__ModelAlias: "main"
+      MultimodalOptions__Enabled: "true"
+      MultimodalOptions__VisionBackend__BaseUrl: "http://host.docker.internal:8001"
+      MultimodalOptions__VisionModel: "your-vision-model"
+    restart: unless-stopped
