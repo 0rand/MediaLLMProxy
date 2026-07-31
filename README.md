@@ -29,6 +29,35 @@ model receives a terse observation instead of media it cannot see.
         │                  └──────────────┘
 ```
 
+## Dependencies
+
+**Installs automatically — nothing to supply:**
+
+- NuGet packages — `dotnet restore` (run by `build.sh`) fetches everything from
+  nuget.org. The proxy itself (`OAIPreRouter.Cli`) has **zero package
+  references** — pure ASP.NET Core framework. The test project uses only
+  standard packages (xunit, Microsoft.NET.Test.Sdk, Logging.Abstractions).
+- Docker base images — `mcr.microsoft.com/dotnet/sdk:10.0` (build) and
+  `aspnet:10.0` (runtime) are pulled automatically on first build.
+- Runtime — the published binary needs only the ASP.NET Core runtime; the
+  `publish` mode of `build.sh` produces a self-contained single-file binary
+  with **no runtime required at all** on the target machine.
+
+**One manual prerequisite — .NET 10 SDK:**
+
+| Platform | Install |
+|---|---|
+| Linux | `curl -fsSL https://dot.net/v1/dotnet-install.sh \| bash -s -- --channel 10.0` (or distro packages: `apt install dotnet-sdk-10.0`) |
+| macOS | `brew install --cask dotnet-sdk` or the dotnet-install.sh above |
+| Windows | `winget install Microsoft.DotNet.SDK.10` |
+
+`build.sh` checks for `dotnet` and fails with a clear message if it's missing.
+
+**Bring your own (not shipped):** the text model and vision model endpoints.
+Any OpenAI-compatible server — vLLM, oMLX, Ollama, llama.cpp, LM Studio —
+on any machine reachable from the proxy. No Python, no ffmpeg, no sidecars
+required for the vision path.
+
 ## Quick start
 
 Requirements: .NET 10 SDK, any OpenAI-compatible text endpoint, any
