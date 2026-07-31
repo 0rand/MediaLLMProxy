@@ -85,6 +85,87 @@ The proxy answers from your text model — informed by the local vision model.
 Security: data-URL + HTTPS-only URL policy (SSRF boundary), observation
 markers, local-backend Authorization stripping, configurable media size cap.
 
+## Integrations
+
+### Hermes (Nous Research agent)
+
+Add a custom provider (verified working config):
+
+```yaml
+# ~/.hermes/config.yaml
+custom_providers:
+  - name: MEDIABRIDGE
+    api_key: ''                      # local proxy — no key needed
+    api_mode: openai
+    base_url: http://localhost:7071/v1
+    model: main
+    models:
+      main:
+        context_length: 200000
+        supports_vision: true        # ← the key: Hermes attaches images natively
+        extra_body:
+          temperature: 0.2
+```
+
+Then select the provider/model (`/model` → MEDIABRIDGE/main) and restart the
+gateway. Behavior:
+
+- **Attached images** (`/image <path>`, clipboard paste) — routed natively to
+  the main model → the proxy bridge sees them → observation → your text model
+  answers. The vision MCP does **not** fire.
+- **`@image:` text mentions** — the vision-tool path (tool reference, not an
+  attachment). The model may choose to call `vision_analyze` on its own.
+
+Hermes gotchas:
+
+- `vision: auto` semantics (Primo-tested): the vision MCP **never fires** when
+  the main model declares `supports_vision: true` — and there is **no auxiliary
+  fallback**: if the main model is text-only, vision fails. Keep an explicit
+  `auxiliary.vision` provider configured as a safety net for text-only routes.
+- The per-model flag can be shadowed: Hermes resolves `model.supports_vision`
+  (top-level) **first**, and a `false` there wins over the per-provider `true`.
+  If your default model block sets it, remove the top-level key.
+- Auto-titles after image chats may 400: Hermes serializes the base64 into the
+  title prompt and hits the context limit. Cosmetic.
+
+### opencode
+
+Add a provider with a single model (verified working config):
+
+```jsonc
+// ~/.config/opencode/opencode.jsonc
+"provider": {
+  "MEDIABRIDGE": {
+    "api": "http://localhost:7071/v1",
+    "models": {
+      "main": {
+        "id": "main",
+        "attachment": true,
+        "modalities": { "input": ["text", "image"], "output": ["text"] }
+      }
+    }
+  }
+}
+```
+
+opencode gotchas:
+
+- The capability gate is **`modalities.input`** — `vision: true` is **not** a
+  schema key and is silently ignored. Without `modalities`, the TUI replaces
+  pasted images with `ERROR: Cannot read "image.png" (this model does not
+  support image input)`.
+- The server **caches config per instance** — restart the server after editing
+  `opencode.jsonc`. `Model not found: <provider>/<model>` = stale config.
+- CLI `-f file.png` attachments go through the **Read tool as text** — never
+  image parts. Real image parts flow via **TUI paste** or the HTTP API
+  `file` part: `{"type": "file", "path": "...", "mime": "image/png", "url": "data:..."}`.
+- HTTP API session override: `{"modelID": "main", "providerID": "MEDIABRIDGE", "variant": "default"}`.
+
+### Any OpenAI-compatible client
+
+Send `model: main` (or whatever `ModelAlias` is) with standard `image_url`
+parts. The proxy handles the rest. `/v1/models` tells clients what to send.
+
 ## Configuration
 
 Everything is environment variables (`.NET` config binding) or
@@ -105,6 +186,49 @@ Everything is environment variables (`.NET` config binding) or
 | `RoutingOptions__VerboseRequests` / `VerboseRewrites` | log incoming body / rewritten body |
 
 See `docs/ARCHITECTURE.md` for the full design, request flow, and operational notes.
+
+## Gotchas & caveats
+
+- **Base URL**: the proxy appends `/v1/chat/completions` to the backend root.
+  DeepSeek GA: `https://api.deepseek.com` (adding `/v1` yourself → `/v1/v1/...`
+  → 404). vLLM/oMLX/Ollama: `http://host:port` (their OpenAI route is already
+  `/v1/...`).
+- **Observation quality**: some vision models (e.g. Qwen-VL) answer verbosely —
+  the terse system prompt helps; `MaxObservationTokens` caps the damage. A
+  verbose observation can still *bias* the text model (it's marked untrusted,
+  but it is content). Prefer small, factual observations.
+- **Latency**: a detour adds ~1–6 s per image (cold); repeat images are
+  byte-keyed cache hits (ms). Large conversations with several images multiply
+  it.
+- **The cache is in-memory** — a proxy restart clears it (the first repeat
+  image after a restart is a miss).
+- **DeepSeek thinking mode** eats `max_tokens` on reasoning — small caps return
+  empty `content` with `finish_reason: length`. Use `"thinking": {"type":
+  "disabled"}` or ≥512 tokens in tests.
+- **Auth model**: client `Authorization` flows to remote backends and to the
+  vision detour; a configured backend `ApiKey` overrides it; local backends
+  strip incoming auth by default.
+- **Audio**: the bridge detects `input_audio` and detours to a Whisper
+  endpoint (see `SttDetourClient`) — config-disabled by default in this release.
+- **`/health`** exposes bridge counters (scans, detours, cache hits, rewrites) —
+  handy for verifying the bridge fired on a request.
+
+## Best practices
+
+1. **Always set `RewriteModel` + `ModelAlias`** — the proxy is a one-model
+   gateway; clients should never need (or see) the real model id.
+2. **Verify the bridge fired** with `X-PreRouter-Media: image` on the response,
+   or the `/health` counters, or `RoutingOptions__VerboseRewrites=true` to log
+   exactly what the text model receives.
+3. **Start with the curl example** before wiring agents — one moving part at a
+   time.
+4. **Keep secrets out of configs** — `ApiKey` via env var at launch, never in
+   `appsettings.json` or compose files.
+5. **Use the byte-keyed cache deliberately** — identical images across users
+   share observations; the cache key is bytes+model+prompt-version.
+6. **For production**: run behind the multi-stage Dockerfile, pass config via
+   environment, keep `MultimodalOptions__Enabled` off until the text backend is
+   proven, then flip it.
 
 ## Testing
 
