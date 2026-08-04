@@ -64,6 +64,10 @@ required for the vision path.
 
 ## Quick start
 
+> **New here? Read [QUICKSTART.md](QUICKSTART.md) first** — it covers the full
+> configuration model: which parameters live in `appsettings.json` vs
+> environment variables, a complete working example, and the smoke-test chain.
+
 Requirements: .NET 10 SDK, any OpenAI-compatible text endpoint, any
 OpenAI-compatible vision endpoint.
 
