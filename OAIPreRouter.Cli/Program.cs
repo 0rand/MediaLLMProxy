@@ -48,6 +48,9 @@ public class Program
         var app = builder.Build();
 
         var options = app.Services.GetRequiredService<IOptions<RoutingOptions>>().Value;
+        // Resolve the injected guard prompt ONCE at startup (file path read here;
+        // fail-fast on a missing guard file rather than silently serving unguarded).
+        var injectedSystemPrompt = options.PrimaryBackend.GetEffectiveInjectedPrompt();
         var limiter = app.Services.GetRequiredService<ConnectionLimiter>();
         var log = app.Logger;
         var multimodal = app.Services.GetRequiredService<IOptions<MultimodalOptions>>().Value;
@@ -212,8 +215,8 @@ public class Program
                 body = JsonBodyRewriter.TryRewriteModel(body, backend.RewriteModel) ?? body;
 
             // === Guard injection: prepend a system prompt to EVERY request (e.g. task-specific hardening) ===
-            if (!string.IsNullOrWhiteSpace(backend.InjectedSystemPrompt))
-                body = JsonBodyRewriter.TryInjectSystemPrompt(body, backend.InjectedSystemPrompt) ?? body;
+            if (!string.IsNullOrWhiteSpace(injectedSystemPrompt))
+                body = JsonBodyRewriter.TryInjectSystemPrompt(body, injectedSystemPrompt) ?? body;
             var targetUri = JoinUrl(backend.BaseUrl, "/v1/chat/completions");
 
             // === Structured Detection Log ===

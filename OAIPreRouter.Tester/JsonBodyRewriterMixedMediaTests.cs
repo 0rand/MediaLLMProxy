@@ -77,6 +77,56 @@ public class JsonBodyRewriterMixedMediaTests
     }
 
     [Fact]
+    public void EffectivePrompt_FileWinsOverInline()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, "FILE-GUARD\nline two");
+            var backend = new BackendConfig
+            {
+                BaseUrl = "http://localhost:8000",
+                InjectedSystemPrompt = "INLINE-GUARD",
+                InjectedSystemPromptPath = path
+            };
+
+            var effective = backend.GetEffectiveInjectedPrompt();
+
+            Assert.Equal("FILE-GUARD\nline two", effective);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void EffectivePrompt_InlineUsed_WhenNoPath()
+    {
+        var backend = new BackendConfig { BaseUrl = "http://localhost:8000", InjectedSystemPrompt = "INLINE-GUARD" };
+
+        Assert.Equal("INLINE-GUARD", backend.GetEffectiveInjectedPrompt());
+    }
+
+    [Fact]
+    public void EffectivePrompt_Null_WhenNeitherSet()
+    {
+        var backend = new BackendConfig { BaseUrl = "http://localhost:8000" };
+
+        Assert.Null(backend.GetEffectiveInjectedPrompt());
+    }
+
+    [Fact]
+    public void EffectivePrompt_MissingFile_Throws()
+    {
+        // unreadable path → IOException (FileNotFound or DirectoryNotFound —
+        // both mean the guard file is not there; fail-fast either way)
+        var backend = new BackendConfig { BaseUrl = "http://localhost:8000", InjectedSystemPromptPath = "/nonexistent/guard.txt" };
+
+        Assert.ThrowsAny<IOException>(() => backend.GetEffectiveInjectedPrompt());
+    }
+
+    [Fact]
     public void Mixed_ImageAndAudio_StripsBoth_And_InjectsCombinedObservation()
     {
         var body = "{\"model\":\"deepseek-v4-flash\",\"messages\":[{\"role\":\"user\",\"content\":[" +
