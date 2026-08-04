@@ -6,6 +6,54 @@ using OAIPreRouter.Cli.Models;
 
 public static class JsonBodyRewriter
 {
+    /// <summary>
+    /// Prepends a system message to the messages array of a chat-completions body.
+    /// Returns null when the body has no messages array (nothing to inject into).
+    /// The injected message lands BEFORE the client's own messages (including its
+    /// system prompt), so it acts as a guard that cannot be overridden by later content.
+    /// </summary>
+    public static string? TryInjectSystemPrompt(string json, string prompt)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("messages", out var messages) ||
+                messages.ValueKind != JsonValueKind.Array)
+                return null;
+
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                writer.WriteStartObject();
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (prop.NameEquals("messages"))
+                    {
+                        writer.WritePropertyName("messages");
+                        writer.WriteStartArray();
+                        writer.WriteStartObject();
+                        writer.WriteString("role", "system");
+                        writer.WriteString("content", prompt);
+                        writer.WriteEndObject();
+                        foreach (var msg in messages.EnumerateArray())
+                            msg.WriteTo(writer);
+                        writer.WriteEndArray();
+                    }
+                    else
+                    {
+                        prop.WriteTo(writer);
+                    }
+                }
+                writer.WriteEndObject();
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public static string? TryRewriteModel(string json, string localModel)
     {
         try

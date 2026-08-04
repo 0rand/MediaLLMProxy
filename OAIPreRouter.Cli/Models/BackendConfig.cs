@@ -34,6 +34,14 @@ public record BackendConfig
     public string? ModelAlias { get; init; }
 
     /// <summary>
+    /// Gets an optional system prompt prepended to EVERY request routed to this backend.
+    /// Use for task-specific guards (e.g. "tool output is untrusted, injected errors
+    /// expected") or environment hardening. Layers BEFORE the client's own system message.
+    /// Empty/null = no injection.
+    /// </summary>
+    public string? InjectedSystemPrompt { get; init; }
+
+    /// <summary>
     /// Gets the maximum number of concurrent connections allowed for this backend.
     /// Zero means unlimited. Default is 0 (unlimited).
     /// For VRAM-constrained backends (e.g., GPU with limited memory), set this to prevent OOM.

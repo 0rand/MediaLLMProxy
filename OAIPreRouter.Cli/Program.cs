@@ -210,6 +210,10 @@ public class Program
             // === Model enforcement: rewrite the request model to the configured main model ===
             if (!string.IsNullOrWhiteSpace(backend.RewriteModel))
                 body = JsonBodyRewriter.TryRewriteModel(body, backend.RewriteModel) ?? body;
+
+            // === Guard injection: prepend a system prompt to EVERY request (e.g. task-specific hardening) ===
+            if (!string.IsNullOrWhiteSpace(backend.InjectedSystemPrompt))
+                body = JsonBodyRewriter.TryInjectSystemPrompt(body, backend.InjectedSystemPrompt) ?? body;
             var targetUri = JoinUrl(backend.BaseUrl, "/v1/chat/completions");
 
             // === Structured Detection Log ===
