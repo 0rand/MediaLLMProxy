@@ -112,6 +112,44 @@ public class VisionDetourClientTests
     }
 
     [Fact]
+    public void BuildPayload_BackendSamplingOverrides_IncludedInPayload()
+    {
+        // Arrange
+        var opts = new MultimodalOptions();
+        var backend = new BackendConfig { BaseUrl = "http://localhost:8000", Temperature = 0.2, TopP = 0.9 };
+        var parts = Array.Empty<MediaContentScanner.MediaPart>();
+
+        // Act
+        var payload = VisionDetourClient.BuildPayload(opts, "test", parts, backend: backend);
+        var doc = JsonDocument.Parse(payload);
+
+        // Assert
+        Assert.Equal(0.2, doc.RootElement.GetProperty("temperature").GetDouble());
+        Assert.Equal(0.9, doc.RootElement.GetProperty("top_p").GetDouble());
+    }
+
+    [Fact]
+    public void BuildPayload_NoSamplingOverrides_OmitsFields()
+    {
+        // Arrange
+        var opts = new MultimodalOptions();
+        var parts = Array.Empty<MediaContentScanner.MediaPart>();
+
+        // Act — no backend passed (null) and backend with null sampling
+        var payloadNoBackend = VisionDetourClient.BuildPayload(opts, "test", parts);
+        var payloadNullBackend = VisionDetourClient.BuildPayload(opts, "test", parts,
+            backend: new BackendConfig { BaseUrl = "http://localhost:8000" });
+
+        // Assert
+        foreach (var payload in new[] { payloadNoBackend, payloadNullBackend })
+        {
+            var doc = JsonDocument.Parse(payload);
+            Assert.False(doc.RootElement.TryGetProperty("temperature", out _));
+            Assert.False(doc.RootElement.TryGetProperty("top_p", out _));
+        }
+    }
+
+    [Fact]
     public async Task GetObservation_StripsWhitespace()
     {
         // Arrange
@@ -128,6 +166,36 @@ public class VisionDetourClientTests
         Assert.True(obs.Success);
         Assert.Equal("red", obs.Text);
         Assert.Null(obs.ErrorKind);
+    }
+
+    [Fact]
+    public async Task GetObservation_Primary500_UsesConfiguredFallback()
+    {
+        var handler = new FakeHandler(req =>
+        {
+            if (req.RequestUri!.Host == "primary")
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(@"{""choices"":[{""message"":{""content"":""fallback observation""}}]}")
+            };
+        });
+        var opts = Options.Create(new MultimodalOptions
+        {
+            VisionBackend = new BackendConfig { BaseUrl = "http://primary:8000" },
+            VisionModel = "m5-vision",
+            VisionFallbackBackend = new BackendConfig { BaseUrl = "http://fallback:8008" },
+            VisionFallbackModel = "qwen2.5-vl-3b",
+            TimeoutSeconds = 2
+        });
+        var client = new VisionDetourClient(new HttpClient(handler), opts, new TestLogger<VisionDetourClient>());
+
+        var observation = await client.GetObservationAsync("Locate the button", Array.Empty<MediaContentScanner.MediaPart>(), CancellationToken.None);
+
+        Assert.True(observation.Success);
+        Assert.Equal("fallback observation", observation.Text);
+        Assert.True(observation.UsedFallback);
     }
 
     [Fact]

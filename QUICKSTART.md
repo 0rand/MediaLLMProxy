@@ -75,11 +75,21 @@ file is the right home for stable, non-secret defaults (e.g. vision model id).
 | `RoutingOptions__PrimaryBackend__ModelAlias` | name advertised via `/v1/models` (clients ask for this) |
 | `RoutingOptions__PrimaryBackend__InjectedSystemPrompt` | guard prompt prepended to every request (inline) |
 | `RoutingOptions__PrimaryBackend__InjectedSystemPromptPath` | guard prompt from a file (wins over inline; missing file aborts startup) |
+| `RoutingOptions__PrimaryBackend__Temperature` | text sampling override — forced on every request, beats client values (null = leave client's) |
+| `RoutingOptions__PrimaryBackend__TopP` | text sampling override — forced on every request, beats client values (null = leave client's) |
 | `RoutingOptions__VerboseRequests` | log incoming bodies (debug) |
 | `RoutingOptions__VerboseRewrites` | log the rewritten body actually sent to the text model |
 | `MultimodalOptions__Enabled` | master bridge switch (true to bridge images) |
-| `MultimodalOptions__VisionBackend__BaseUrl` | vision detour endpoint |
-| `MultimodalOptions__VisionModel` | vision model id (JSON default usually fine) |
+| `MultimodalOptions__VisionBackend__BaseUrl` | primary vision detour endpoint |
+| `MultimodalOptions__VisionBackend__ApiKey` | primary vision token; omit for local M5/oMLX/vLLM |
+| `MultimodalOptions__VisionModel` | primary vision model id |
+| `MultimodalOptions__VisionFallbackBackend__BaseUrl` | optional failure-only fallback vision endpoint |
+| `MultimodalOptions__VisionFallbackBackend__ApiKey` | fallback vision token; omit for local Qwen llama.cpp |
+| `MultimodalOptions__VisionFallbackModel` | failure-only fallback model id |
+| `MultimodalOptions__VisionBackend__Temperature` | vision sampling override — included in every observation request (null = backend default) |
+| `MultimodalOptions__VisionBackend__TopP` | vision sampling override — included in every observation request (null = backend default) |
+| `MultimodalOptions__VisionFallbackBackend__Temperature` | fallback vision sampling override (null = backend default) |
+| `MultimodalOptions__VisionFallbackBackend__TopP` | fallback vision sampling override (null = backend default) |
 
 ---
 

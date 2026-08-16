@@ -80,6 +80,23 @@ public class ObservationCacheTests
     }
 
     [Fact]
+    public void DefaultObservationLimit_SupportsDocumentOcr()
+    {
+        Assert.Equal(2048, new MultimodalOptions().MaxObservationTokens);
+    }
+
+    [Fact]
+    public void KeyChanges_WhenRequestTextChanges()
+    {
+        var image = "data:image/png;base64,same-image";
+        var model = "deepseek-ocr-2";
+        var transcription = ObservationCache.BuildKey(image, model, "Free OCR.");
+        var location = ObservationCache.BuildKey(image, model, "Where is the account number?");
+
+        Assert.NotEqual(transcription, location);
+    }
+
+    [Fact]
     public void Concurrency_ParallelSets_AllRetrievable()
     {
         var cache = CreateCache(capacity: 1000);

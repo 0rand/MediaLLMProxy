@@ -217,6 +217,14 @@ public class Program
             // === Guard injection: prepend a system prompt to EVERY request (e.g. task-specific hardening) ===
             if (!string.IsNullOrWhiteSpace(injectedSystemPrompt))
                 body = JsonBodyRewriter.TryInjectSystemPrompt(body, injectedSystemPrompt) ?? body;
+
+            // === Sampling override: enforce configured temperature/top_p on the text backend ===
+            // Mirrors opencode-compat-proxy (enforce_mimo_main_params / enforce_ds4f_params):
+            // applied LAST so configured sampling cannot be superseded by the caller.
+            if (backend.Temperature is double temp)
+                body = JsonBodyRewriter.TryRewriteSampling(body, "temperature", temp) ?? body;
+            if (backend.TopP is double topP)
+                body = JsonBodyRewriter.TryRewriteSampling(body, "top_p", topP) ?? body;
             var targetUri = JoinUrl(backend.BaseUrl, "/v1/chat/completions");
 
             // === Structured Detection Log ===
@@ -270,6 +278,7 @@ public class Program
                     // Process images (existing vision detour path)
                     if (imageParts.Count > 0)
                     {
+                        var userText = UserTextExtractor.Extract(body, media);
                         var imageDataUrls = imageParts
                             .Where(p => p.Url != null && p.Url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
                             .Select(p => p.Url!)
@@ -281,7 +290,7 @@ public class Program
                         if (useCache)
                         {
                             var concatenated = string.Join("|||", imageDataUrls);
-                            cacheKey = ObservationCache.BuildKey(concatenated, multimodal.VisionModel);
+                            cacheKey = ObservationCache.BuildKey(concatenated, multimodal.VisionModel, userText);
                         }
 
                         string? cachedObs = null;
@@ -301,7 +310,6 @@ public class Program
                             metrics.CacheMiss();
 
                             var swBridge = Stopwatch.StartNew();
-                            var userText = UserTextExtractor.Extract(body, media);
                             var clientApiKey = ctx.Request.Headers.Authorization.ToString();
                             if (opts.VerboseRequests)
                                 log.LogWarning("[{RequestId}] DETOUR vision payload: images={Count} imageDataUrlChars={Sizes} userTextLen={Len} clientKey={HasKey}",
@@ -309,7 +317,9 @@ public class Program
                             var obs = await visionDetour.GetObservationAsync(userText, imageParts, ctx.RequestAborted, clientApiKey);
                             if (obs.Success)
                             {
-                                if (useCache && cacheKey != null)
+                                // Degraded fallback observations are deliberately not cached: every new request
+                                // must retry the primary M5 model so recovery immediately restores quality.
+                                if (useCache && cacheKey != null && !obs.UsedFallback)
                                     obsCache.Set(cacheKey, obs.Text);
 
                                 foreach (var img in imageParts)
