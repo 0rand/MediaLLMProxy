@@ -19,6 +19,10 @@ public record MultimodalOptions
     public BackendConfig VisionBackend { get; init; } = new() { BaseUrl = "http://localhost:8000" };
     public string VisionModel { get; init; } = "Qwen3.6-35B-A3B-MLX-VL-oQ8";
 
+    /// <summary>Optional fallback used only when the primary vision request fails.</summary>
+    public BackendConfig? VisionFallbackBackend { get; init; }
+    public string? VisionFallbackModel { get; init; }
+
     public string VideoModel { get; init; } = "mlx-community--gemma-4-12B-it-OptiQ-4bit";
     public int FrameIntervalSec { get; init; } = 1;
     public int MaxFrames { get; init; } = 10;

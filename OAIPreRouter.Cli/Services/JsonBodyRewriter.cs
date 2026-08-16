@@ -93,6 +93,47 @@ public static class JsonBodyRewriter
     }
 
     /// <summary>
+    /// Sets a top-level numeric sampling field (e.g. "temperature" or "top_p") on a
+    /// chat-completions body, replacing any client-supplied value. Mirrors the
+    /// opencode-compat-proxy model-alias override: applied LAST so configured
+    /// sampling cannot be superseded by the caller. Returns null on parse failure
+    /// (caller then keeps the original body).
+    /// </summary>
+    public static string? TryRewriteSampling(string json, string field, double value)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                writer.WriteStartObject();
+                var wrote = false;
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (prop.NameEquals(field))
+                    {
+                        writer.WriteNumber(field, value);
+                        wrote = true;
+                    }
+                    else
+                    {
+                        prop.WriteTo(writer);
+                    }
+                }
+                if (!wrote)
+                    writer.WriteNumber(field, value);
+                writer.WriteEndObject();
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Rewrites media parts out and observations in, in ONE validated pass.
     /// Returns null on parse failure (caller then fails closed with 502).
     /// </summary>

@@ -217,6 +217,14 @@ public class Program
             // === Guard injection: prepend a system prompt to EVERY request (e.g. task-specific hardening) ===
             if (!string.IsNullOrWhiteSpace(injectedSystemPrompt))
                 body = JsonBodyRewriter.TryInjectSystemPrompt(body, injectedSystemPrompt) ?? body;
+
+            // === Sampling override: enforce configured temperature/top_p on the text backend ===
+            // Mirrors opencode-compat-proxy (enforce_mimo_main_params / enforce_ds4f_params):
+            // applied LAST so configured sampling cannot be superseded by the caller.
+            if (backend.Temperature is double temp)
+                body = JsonBodyRewriter.TryRewriteSampling(body, "temperature", temp) ?? body;
+            if (backend.TopP is double topP)
+                body = JsonBodyRewriter.TryRewriteSampling(body, "top_p", topP) ?? body;
             var targetUri = JoinUrl(backend.BaseUrl, "/v1/chat/completions");
 
             // === Structured Detection Log ===
@@ -309,7 +317,9 @@ public class Program
                             var obs = await visionDetour.GetObservationAsync(userText, imageParts, ctx.RequestAborted, clientApiKey);
                             if (obs.Success)
                             {
-                                if (useCache && cacheKey != null)
+                                // Degraded fallback observations are deliberately not cached: every new request
+                                // must retry the primary M5 model so recovery immediately restores quality.
+                                if (useCache && cacheKey != null && !obs.UsedFallback)
                                     obsCache.Set(cacheKey, obs.Text);
 
                                 foreach (var img in imageParts)

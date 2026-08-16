@@ -67,4 +67,20 @@ public record BackendConfig
     /// For VRAM-constrained backends (e.g., GPU with limited memory), set this to prevent OOM.
     /// </summary>
     public int MaxConcurrentConnections { get; init; } = 0;
+
+    /// <summary>
+    /// Gets an optional sampling override: temperature.
+    /// When set, every request to this backend carries this temperature — the vision
+    /// detour payload includes it, and the text-forwarding path overrides whatever the
+    /// client sent. Null (default) = leave the client's value untouched.
+    /// </summary>
+    public double? Temperature { get; init; }
+
+    /// <summary>
+    /// Gets an optional sampling override: top_p.
+    /// When set, every request to this backend carries this top_p — the vision
+    /// detour payload includes it, and the text-forwarding path overrides whatever the
+    /// client sent. Null (default) = leave the client's value untouched.
+    /// </summary>
+    public double? TopP { get; init; }
 }

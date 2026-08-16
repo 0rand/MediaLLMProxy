@@ -216,15 +216,53 @@ Everything is environment variables (`.NET` config binding) or
 | `RoutingOptions__PrimaryBackend__ModelAlias` | name advertised to clients |
 | `RoutingOptions__PrimaryBackend__InjectedSystemPrompt` | system prompt prepended to EVERY request (task-specific guard) |
 | `RoutingOptions__PrimaryBackend__InjectedSystemPromptPath` | path to a file whose contents are used as the guard (wins over the inline string; read once at startup; missing file aborts startup) |
+| `RoutingOptions__PrimaryBackend__Temperature` | text sampling override — forced on every request, beats client values (null = leave client's) |
+| `RoutingOptions__PrimaryBackend__TopP` | text sampling override — forced on every request, beats client values (null = leave client's) |
 | `MultimodalOptions__Enabled` | master bridge switch |
-| `MultimodalOptions__VisionBackend__BaseUrl` | vision detour endpoint |
-| `MultimodalOptions__VisionModel` | vision model id |
+| `MultimodalOptions__VisionBackend__BaseUrl` | primary vision detour endpoint |
+| `MultimodalOptions__VisionBackend__ApiKey` | primary vision API token (omit for unauthenticated local inference) |
+| `MultimodalOptions__VisionModel` | primary vision model id |
+| `MultimodalOptions__VisionFallbackBackend__BaseUrl` | optional failure-only fallback vision endpoint |
+| `MultimodalOptions__VisionFallbackBackend__ApiKey` | fallback vision API token (omit for unauthenticated local inference) |
+| `MultimodalOptions__VisionFallbackModel` | fallback vision model id |
+| `MultimodalOptions__VisionBackend__Temperature` | vision sampling override — included in every observation request (null = backend default) |
+| `MultimodalOptions__VisionBackend__TopP` | vision sampling override — included in every observation request (null = backend default) |
+| `MultimodalOptions__VisionFallbackBackend__Temperature` | fallback vision sampling override (null = backend default) |
+| `MultimodalOptions__VisionFallbackBackend__TopP` | fallback vision sampling override (null = backend default) |
 | `MultimodalOptions__MaxObservationTokens` | observation length cap |
 | `MultimodalOptions__TimeoutSeconds` | detour timeout |
 | `MultimodalOptions__CacheTtlHours` / `CacheCapacity` | observation cache |
 | `RoutingOptions__VerboseRequests` / `VerboseRewrites` | log incoming body / rewritten body |
 
 See `docs/ARCHITECTURE.md` for the full design, request flow, and operational notes.
+
+### Vision deployment profiles
+
+The bridge has exactly two configurable vision routes: a primary and an optional
+**failure-only** fallback. It never selects a model from prompt keywords.
+Choose the primary manually for your deployment:
+
+```bash
+# Local strong vision primary (no token) + local compact fallback
+export MultimodalOptions__VisionBackend__BaseUrl="http://vision-host:8000"
+export MultimodalOptions__VisionModel="your-strong-vlm"
+export MultimodalOptions__VisionFallbackBackend__BaseUrl="http://vision-host:8008"
+export MultimodalOptions__VisionFallbackModel="your-compact-vlm"
+```
+
+```bash
+# Cloud primary for users without a strong local VLM + local fallback
+export MultimodalOptions__VisionBackend__BaseUrl="https://openrouter.ai/api"
+export MultimodalOptions__VisionBackend__ApiKey="$OPENROUTER_API_KEY"
+export MultimodalOptions__VisionModel="google/gemini-2.5-flash"
+export MultimodalOptions__VisionFallbackBackend__BaseUrl="http://localhost:8008"
+export MultimodalOptions__VisionFallbackModel="your-local-vlm"
+```
+
+A configured backend `ApiKey` is authoritative and is never replaced by a
+caller's Authorization header. Do not put keys in JSON or source control.
+Fallback observations are not cached, so the next media request always retries
+the primary after recovery.
 
 ## Guard prompt injection (task-specific hardening)
 
