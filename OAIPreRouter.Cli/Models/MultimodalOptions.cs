@@ -27,10 +27,10 @@ public record MultimodalOptions
     public string SttModel { get; init; } = "stt-large-v3";
     public string SttPrompt { get; init; } = "prompt-v1";
 
-    public int MaxObservationTokens { get; init; } = 512;
+    public int MaxObservationTokens { get; init; } = 2048;
     public int TimeoutSeconds { get; init; } = 90;
 
-    /// <summary>Cache: SHA-256(bytes) + model + prompt version -> observation.</summary>
+    /// <summary>Cache: SHA-256(media bytes + model + prompt version + request text) -> observation.</summary>
     public int CacheTtlHours { get; init; } = 24;
     public int CacheCapacity { get; init; } = 512;
 

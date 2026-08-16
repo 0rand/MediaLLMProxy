@@ -270,6 +270,7 @@ public class Program
                     // Process images (existing vision detour path)
                     if (imageParts.Count > 0)
                     {
+                        var userText = UserTextExtractor.Extract(body, media);
                         var imageDataUrls = imageParts
                             .Where(p => p.Url != null && p.Url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
                             .Select(p => p.Url!)
@@ -281,7 +282,7 @@ public class Program
                         if (useCache)
                         {
                             var concatenated = string.Join("|||", imageDataUrls);
-                            cacheKey = ObservationCache.BuildKey(concatenated, multimodal.VisionModel);
+                            cacheKey = ObservationCache.BuildKey(concatenated, multimodal.VisionModel, userText);
                         }
 
                         string? cachedObs = null;
@@ -301,7 +302,6 @@ public class Program
                             metrics.CacheMiss();
 
                             var swBridge = Stopwatch.StartNew();
-                            var userText = UserTextExtractor.Extract(body, media);
                             var clientApiKey = ctx.Request.Headers.Authorization.ToString();
                             if (opts.VerboseRequests)
                                 log.LogWarning("[{RequestId}] DETOUR vision payload: images={Count} imageDataUrlChars={Sizes} userTextLen={Len} clientKey={HasKey}",

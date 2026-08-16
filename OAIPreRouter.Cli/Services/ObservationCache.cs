@@ -7,7 +7,7 @@ using Microsoft.Extensions.Options;
 using OAIPreRouter.Cli.Models;
 
 /// <summary>
-/// Thread-safe observation cache keyed on SHA-256(media bytes) + model + prompt version.
+/// Thread-safe observation cache keyed on SHA-256(media bytes + model + prompt version + request text).
 /// TTL eviction on read; capacity cap (oldest-style eviction by insertion order is fine).
 /// </summary>
 public sealed class ObservationCache
@@ -24,11 +24,19 @@ public sealed class ObservationCache
         _opts = opts.Value;
     }
 
-    public static string BuildKey(string dataUrl, string model)
+    public static string BuildKey(string dataUrl, string model) => BuildKey(dataUrl, model, string.Empty);
+
+    /// <summary>
+    /// Builds a key for a specific media interpretation request. The request text is part of the
+    /// identity: identical image bytes can legitimately have different OCR, layout, or locate
+    /// answers.
+    /// </summary>
+    public static string BuildKey(string dataUrl, string model, string requestText)
     {
-        var bytes = Encoding.UTF8.GetBytes(dataUrl);
+        var material = string.Join('\0', dataUrl, model, PromptVersion, requestText);
+        var bytes = Encoding.UTF8.GetBytes(material);
         var hash = Convert.ToHexString(SHA256.HashData(bytes));
-        return $"{hash}|{model}|{PromptVersion}";
+        return hash;
     }
 
     public bool TryGet(string key, out string? observation)
