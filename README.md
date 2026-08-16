@@ -264,6 +264,94 @@ caller's Authorization header. Do not put keys in JSON or source control.
 Fallback observations are not cached, so the next media request always retries
 the primary after recovery.
 
+### Backup vision model (failure-only fallback)
+
+The bridge supports **one primary vision route and one optional backup**. The
+backup is strictly failure-only — it never competes with the primary and is
+never selected by prompt keywords:
+
+```
+primary success
+  → use it
+
+primary HTTP failure / timeout / malformed response / network error
+  → use the configured backup once
+
+media-policy rejection / client cancellation
+  → no fallback (policy is policy)
+```
+
+```bash
+# Strong local primary + compact local backup
+export MultimodalOptions__VisionBackend__BaseUrl="http://vision-host:8000"
+export MultimodalOptions__VisionModel="your-strong-vlm"
+export MultimodalOptions__VisionFallbackBackend__BaseUrl="http://vision-host:8008"
+export MultimodalOptions__VisionFallbackModel="your-compact-vlm"
+```
+
+Two deliberate behaviors:
+
+- **Backup observations are never cached.** Every new media request retries the
+  primary first, so the moment the primary recovers, quality snaps back — a
+  degraded observation never lingers in the cache.
+- **The backup is a safety net, not a load balancer.** If the primary is slow
+  but healthy, you wait for it. Use the primary's `TimeoutSeconds` to bound
+  that wait.
+
+### Sampling overrides (per-backend temperature / top-p)
+
+Every backend config (`PrimaryBackend`, `VisionBackend`, `VisionFallbackBackend`)
+accepts optional `Temperature` and `TopP`. When set, the proxy **forces** those
+values on every request to that backend — the client cannot override them.
+
+- **Text path** — applied LAST in the forwarding pipeline, so configured
+  sampling always beats whatever the client sent. This is the fix for agents
+  that hard-code sampling (e.g. Hermes forces `temperature 1.0 / top_p 1.0`
+  on the main model): pin the proxy to the model's proven tuning and the
+  client's values lose.
+
+  ```bash
+  # DS4F GA example: model is tuned for 0.8/0.25, Hermes sends 1.0/1.0
+  export RoutingOptions__PrimaryBackend__Temperature=0.8
+  export RoutingOptions__PrimaryBackend__TopP=0.25
+  ```
+
+- **Vision path** — included in every observation request. Use `0` for
+  deterministic OCR, or leave unset to keep the backend's default.
+
+  ```bash
+  export MultimodalOptions__VisionBackend__Temperature=0
+  export MultimodalOptions__VisionBackend__TopP=1.0
+  ```
+
+- **Null (default) = leave the client's / backend's value untouched.**
+
+### API keys for cloud models
+
+Any backend — text or vision, primary or fallback — accepts an `ApiKey`. This
+is what lets the proxy use **cloud vision/text models** when you don't have a
+strong local model to spare:
+
+```bash
+# Cloud vision primary (OpenRouter) + local compact backup
+export MultimodalOptions__VisionBackend__BaseUrl="https://openrouter.ai/api"
+export MultimodalOptions__VisionBackend__ApiKey="$OPENROUTER_API_KEY"
+export MultimodalOptions__VisionModel="google/gemini-2.5-flash"
+export MultimodalOptions__VisionFallbackBackend__BaseUrl="http://localhost:8008"
+export MultimodalOptions__VisionFallbackModel="your-local-vlm"
+```
+
+Key semantics:
+
+- A **configured backend key is authoritative** — it replaces any incoming
+  caller `Authorization` header. This matters for a public self-hosted proxy:
+  callers must not be able to swap in their own credential and burn your
+  cloud budget.
+- **Local backends strip incoming auth by default** — no key needed for
+  vLLM/oMLX/llama.cpp on your own network.
+- **Never put keys in `appsettings.json`, compose files, or source control.**
+  Env vars at launch only.
+
 ## Guard prompt injection (task-specific hardening)
 
 The proxy can prepend a system prompt to **every** request routed to a backend —
@@ -340,8 +428,7 @@ metrics. No models or network required.
 
 - Audio bridge (Whisper STT detour — implemented, see `SttDetourClient`)
 - Video/PDF via a local scene-extraction sidecar
-- Per-endpoint output filters (DSML/Qwen-XML → `tool_calls` curing) and
-  sampling overrides
+- Per-endpoint output filters (DSML/Qwen-XML → `tool_calls` curing)
 
 ## License
 
