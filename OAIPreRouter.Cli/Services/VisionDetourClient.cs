@@ -29,13 +29,25 @@ public class VisionDetourClient(HttpClient http, IOptions<MultimodalOptions> opt
     {
         var content = new List<object>();
         if (!string.IsNullOrWhiteSpace(userText)) content.Add(new { type = "text", text = userText });
-        foreach (var p in parts.Where(p => p.Kind == MediaContentScanner.MediaKind.Image && p.Url != null))
-            content.Add(new { type = "image_url", image_url = new { url = p.Url } });
+        foreach (var p in parts)
+        {
+            if (p.Kind == MediaContentScanner.MediaKind.Image && p.Url != null)
+                content.Add(new { type = "image_url", image_url = new { url = p.Url } });
+            else if (p.Kind == MediaContentScanner.MediaKind.Video && p.Url != null && o.VideoSupport)
+                content.Add(new { type = "input_video", video_url = p.Url });
+        }
+        // mlx-vlm rejects system messages alongside video parts ("System message cannot contain videos"),
+        // so the terse-observer system prompt is omitted for video payloads (the model is terse anyway).
+        var hasVideo = parts.Any(p => p.Kind == MediaContentScanner.MediaKind.Video);
+        var messages = new List<object>();
+        if (!hasVideo)
+            messages.Add(new { role = "system", content = TerseObserverSystemPrompt });
+        messages.Add(new { role = "user", content });
 
         var payload = new Dictionary<string, object?>
         {
             ["model"] = model ?? o.VisionModel,
-            ["messages"] = new object[] { new { role = "system", content = TerseObserverSystemPrompt }, new { role = "user", content } },
+            ["messages"] = messages,
             ["max_tokens"] = o.MaxObservationTokens
         };
         // Sampling overrides: when the backend config pins temperature/top_p,

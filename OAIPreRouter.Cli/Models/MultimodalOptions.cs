@@ -16,6 +16,10 @@ public record MultimodalOptions
 
     public bool Enabled { get; init; } = false;
 
+    /// <summary>When true, video content parts (input_video / video_url / video) are detoured to the
+    /// vision backend as-is (backend must accept video natively — e.g. mlx-vlm qwen3_5/qwen3_5_moe).</summary>
+    public bool VideoSupport { get; init; } = false;
+
     public BackendConfig VisionBackend { get; init; } = new() { BaseUrl = "http://localhost:8000" };
     public string VisionModel { get; init; } = "Qwen3.6-35B-A3B-MLX-VL-oQ8";
 

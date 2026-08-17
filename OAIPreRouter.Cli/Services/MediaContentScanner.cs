@@ -37,7 +37,7 @@ public static class MediaContentScanner
                     var kind = type.GetString() switch
                     {
                         "image_url" => MediaKind.Image,
-                        "video" or "video_url" => MediaKind.Video,
+                        "video" or "video_url" or "input_video" => MediaKind.Video,
                         "input_audio" or "audio" or "audio_url" => MediaKind.Audio,
                         _ => MediaKind.None
                     };
@@ -48,6 +48,19 @@ public static class MediaContentScanner
                     if (part.TryGetProperty("image_url", out var iu) && iu.ValueKind == JsonValueKind.Object &&
                         iu.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String)
                         url = u.GetString();
+                    else if (kind == MediaKind.Video && part.TryGetProperty("video_url", out var vu))
+                    {
+                        // OpenAI chat shape: {"type":"input_video","video_url":"data:video/mp4;base64,..."}
+                        // Anthropic-ish shape: {"type":"video_url","video_url":{"url":"..."}}
+                        if (vu.ValueKind == JsonValueKind.String)
+                            url = vu.GetString();
+                        else if (vu.ValueKind == JsonValueKind.Object &&
+                                 vu.TryGetProperty("url", out var vuu) && vuu.ValueKind == JsonValueKind.String)
+                            url = vuu.GetString();
+                    }
+                    else if (kind == MediaKind.Video && part.TryGetProperty("video", out var v) &&
+                             v.ValueKind == JsonValueKind.String)
+                        url = v.GetString();
                     else if (kind == MediaKind.Audio &&
                              part.TryGetProperty("input_audio", out var ia) && ia.ValueKind == JsonValueKind.Object &&
                              ia.TryGetProperty("data", out var d) && d.ValueKind == JsonValueKind.String &&

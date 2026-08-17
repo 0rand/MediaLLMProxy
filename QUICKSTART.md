@@ -80,6 +80,7 @@ file is the right home for stable, non-secret defaults (e.g. vision model id).
 | `RoutingOptions__VerboseRequests` | log incoming bodies (debug) |
 | `RoutingOptions__VerboseRewrites` | log the rewritten body actually sent to the text model |
 | `MultimodalOptions__Enabled` | master bridge switch (true to bridge images) |
+| `MultimodalOptions__VideoSupport` | true = also bridge video parts (input_video/video_url/video) to the vision backend — backend must accept video natively (e.g. mlx-vlm qwen3_5/qwen3_5_moe); the terse-observer system prompt is omitted for video payloads (mlx-vlm rejects system+video) |
 | `MultimodalOptions__VisionBackend__BaseUrl` | primary vision detour endpoint |
 | `MultimodalOptions__VisionBackend__ApiKey` | primary vision token; omit for local M5/oMLX/vLLM |
 | `MultimodalOptions__VisionModel` | primary vision model id |

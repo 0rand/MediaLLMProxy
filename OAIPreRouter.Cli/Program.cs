@@ -350,6 +350,45 @@ public class Program
                         }
                     }
 
+                    // Process video (native pass-through — requires VideoSupport + a video-capable vision backend)
+                    if (videoParts.Count > 0 && multimodal.VideoSupport)
+                    {
+                        var swVideo = Stopwatch.StartNew();
+                        var videoUserText = UserTextExtractor.Extract(body, videoParts);
+                        var videoApiKey = ctx.Request.Headers.Authorization.ToString();
+                        if (opts.VerboseRequests)
+                            log.LogWarning("[{RequestId}] DETOUR video payload: parts={Count} urlChars={Chars} userTextLen={Len}",
+                                requestId, videoParts.Count, string.Join(",", videoParts.Select(p => p.Url?.Length ?? 0)), videoUserText.Length);
+                        var videoObs = await visionDetour.GetObservationAsync(videoUserText, videoParts, ctx.RequestAborted, videoApiKey);
+                        if (videoObs.Success)
+                        {
+                            foreach (var vp in videoParts)
+                            {
+                                observations[vp.MessageIndex] = (observations.ContainsKey(vp.MessageIndex) ? observations[vp.MessageIndex] + "\n" : "") + $"[Video] {videoObs.Text}";
+                            }
+                            metrics.DetourOk();
+                            metrics.RewriteOk();
+                            log.LogInformation("[{RequestId}] BRIDGE video obsChars={Chars} elapsedMs={ElapsedMs}",
+                                requestId, videoObs.Text.Length, swVideo.ElapsedMilliseconds);
+                        }
+                        else
+                        {
+                            log.LogWarning("[{RequestId}] BRIDGE video {Kind}", requestId, videoObs.ErrorKind);
+                            if (videoObs.ErrorKind == "timeout")
+                                metrics.DetourTimeout();
+                            else
+                                metrics.DetourFail();
+                            if (!ctx.Response.HasStarted)
+                            {
+                                ctx.Response.StatusCode = videoObs.ErrorKind == "timeout" ? StatusCodes.Status504GatewayTimeout
+                                                                                          : StatusCodes.Status502BadGateway;
+                                var videoErrorMsg = videoObs.ErrorKind == "policy" ? "Media URL not allowed by policy." : "Vision backend unavailable.";
+                                await ctx.Response.WriteAsJsonAsync(new { error = videoErrorMsg });
+                                return Results.Empty;
+                            }
+                        }
+                    }
+
                     // Process audio (new STT path)
                     if (audioParts.Count > 0)
                     {
