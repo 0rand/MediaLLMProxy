@@ -253,6 +253,81 @@ public static class JsonBodyRewriter
         }
     }
 
+    /// <summary>
+    /// Appends a gated observation block to choices[0].message.content of a NON-streaming
+    /// chat-completions response, so the observation becomes durable in the client's history.
+    /// Returns null on parse failure or when the shape is unexpected (caller keeps the raw body).
+    /// </summary>
+    public static string? TryAppendObservationToJson(string json, string observationBlock)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("choices", out var choices) || choices.GetArrayLength() == 0)
+                return null;
+            var choice = choices[0];
+            if (!choice.TryGetProperty("message", out var message))
+                return null;
+
+            var content = message.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String
+                ? c.GetString() ?? ""
+                : "";
+
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                writer.WriteStartObject();
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (prop.NameEquals("choices"))
+                    {
+                        writer.WritePropertyName("choices");
+                        writer.WriteStartArray();
+                        var first = true;
+                        foreach (var ch in choices.EnumerateArray())
+                        {
+                            writer.WriteStartObject();
+                            foreach (var cp in ch.EnumerateObject())
+                            {
+                                if (first && cp.NameEquals("message"))
+                                {
+                                    writer.WritePropertyName("message");
+                                    writer.WriteStartObject();
+                                    foreach (var mp in cp.Value.EnumerateObject())
+                                    {
+                                        if (mp.NameEquals("content"))
+                                            writer.WriteString("content", content + "\n\n" + observationBlock);
+                                        else
+                                            mp.WriteTo(writer);
+                                    }
+                                    writer.WriteEndObject();
+                                }
+                                else
+                                {
+                                    cp.WriteTo(writer);
+                                }
+                            }
+                            writer.WriteEndObject();
+                            first = false;
+                        }
+                        writer.WriteEndArray();
+                    }
+                    else
+                    {
+                        prop.WriteTo(writer);
+                    }
+                }
+                writer.WriteEndObject();
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static void WriteRewrittenContent(Utf8JsonWriter writer, JsonElement content, int messageIndex,
         HashSet<(int msgIdx, int partIdx)> stripSet,
         IReadOnlyDictionary<int, string> observationsByMessageIndex,

@@ -196,4 +196,67 @@ public class MediaContentScannerTests
         Assert.Equal(MediaContentScanner.MediaKind.Image, part.Kind);
         Assert.Null(part.Url);
     }
+
+    [Fact]
+    public void GetMessageCount_NormalBody_ReturnsCount()
+    {
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":\"c\"}]}";
+        Assert.Equal(3, MediaContentScanner.GetMessageCount(body));
+    }
+
+    [Fact]
+    public void GetMessageCount_NoMessages_ReturnsZero()
+    {
+        Assert.Equal(0, MediaContentScanner.GetMessageCount("{\"model\":\"x\"}"));
+        Assert.Equal(0, MediaContentScanner.GetMessageCount("{invalid"));
+    }
+
+    [Fact]
+    public void LastTurnMedia_MediaInLastMessage_ReturnedAsCurrent()
+    {
+        // image in message 1 (the last message) → current turn
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":\"first\"},{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAA=\"}}]}]}";
+        var media = MediaContentScanner.Scan(body);
+
+        var current = MediaContentScanner.LastTurnMedia(body, media);
+
+        Assert.Single(current);
+        Assert.Equal(1, current[0].MessageIndex);
+    }
+
+    [Fact]
+    public void LastTurnMedia_MediaOnlyInHistory_ReturnsEmpty()
+    {
+        // image in message 0, last message is a text-only follow-up → history, NOT current
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAA=\"}}]},{\"role\":\"assistant\",\"content\":\"it's a cat\"},{\"role\":\"user\",\"content\":\"and the colors?\"}]}";
+        var media = MediaContentScanner.Scan(body);
+
+        var current = MediaContentScanner.LastTurnMedia(body, media);
+
+        Assert.Empty(current);
+    }
+
+    [Fact]
+    public void LastTurnMedia_MixedHistoryAndCurrent_OnlyLastMessageReturned()
+    {
+        // image in message 0 (history) AND message 2 (current turn) → only message 2 detoured
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAA=\"}}]},{\"role\":\"assistant\",\"content\":\"ok\"},{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,BBB=\"}}]}]}";
+        var media = MediaContentScanner.Scan(body);
+
+        var current = MediaContentScanner.LastTurnMedia(body, media);
+
+        Assert.Single(current);
+        Assert.Equal(2, current[0].MessageIndex);
+        Assert.Contains("BBB", current[0].Url);
+    }
+
+    [Fact]
+    public void LastTurnMedia_NoMessages_ReturnsEmpty()
+    {
+        var media = new List<MediaContentScanner.MediaPart>
+        {
+            new(MediaContentScanner.MediaKind.Image, 0, 0, "data:image/png;base64,AAA=")
+        };
+        Assert.Empty(MediaContentScanner.LastTurnMedia("{\"model\":\"x\"}", media));
+    }
 }

@@ -79,4 +79,30 @@ public static class MediaContentScanner
         }
         return found;
     }
+
+    /// <summary>Number of messages in the request body (0 on parse failure / no messages array).</summary>
+    public static int GetMessageCount(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("messages", out var messages) &&
+                messages.ValueKind == JsonValueKind.Array)
+                return messages.GetArrayLength();
+        }
+        catch { }
+        return 0;
+    }
+
+    /// <summary>
+    /// Returns only the media parts belonging to the LAST message — the current turn.
+    /// Media in earlier messages is history: its observations are already durable in the
+    /// conversation (gated blocks appended to prior responses), so it is stripped but never
+    /// detoured. This is what stops the vision model from being reloaded on every turn.
+    /// </summary>
+    public static List<MediaPart> LastTurnMedia(string body, IReadOnlyList<MediaPart> media)
+    {
+        var lastMessageIndex = GetMessageCount(body) - 1;
+        return media.Where(m => m.MessageIndex == lastMessageIndex).ToList();
+    }
 }

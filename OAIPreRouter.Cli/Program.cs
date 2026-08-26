@@ -260,6 +260,7 @@ public class Program
             // === Multimodal bridge (images + video + audio) ===
             string? forwardBody = null;
             var mediaKinds = new List<string>();
+            var observations = new Dictionary<int, string>();
             if (multimodal.Enabled)
             {
                 var media = MediaContentScanner.Scan(body);
@@ -267,13 +268,19 @@ public class Program
                 {
                     metrics.Scan();
 
-                    // Separate media by kind
-                    var imageParts = media.Where(p => p.Kind == MediaContentScanner.MediaKind.Image).ToList();
-                    var videoParts = media.Where(p => p.Kind == MediaContentScanner.MediaKind.Video).ToList();
-                    var audioParts = media.Where(p => p.Kind == MediaContentScanner.MediaKind.Audio).ToList();
+                    // ONLY the last message (the current turn) is detoured. Media in earlier
+                    // messages is history: its observations are already durable in the
+                    // conversation (gated blocks appended to prior responses), so it is stripped
+                    // but never re-detoured — no vision-model reloads on history reprocessing.
+                    var currentMedia = MediaContentScanner.LastTurnMedia(body, media);
+                    var historyMediaCount = media.Count - currentMedia.Count;
+                    if (historyMediaCount > 0)
+                        log.LogInformation("[{RequestId}] BRIDGE history media skipped={Count} (only last turn is detoured)", requestId, historyMediaCount);
 
-                    // Build observations per message index
-                    var observations = new Dictionary<int, string>();
+                    // Separate media by kind (current turn only — history is never detoured)
+                    var imageParts = currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Image).ToList();
+                    var videoParts = currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Video).ToList();
+                    var audioParts = currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Audio).ToList();
 
                     // Process images (existing vision detour path)
                     if (imageParts.Count > 0)
@@ -488,38 +495,53 @@ public class Program
                             mediaKinds.Add(kind);
                     }
 
-                    // If we have observations, rewrite the body
-                    if (observations.Count > 0)
+                    // Always rewrite when media is present: strip ALL media parts (history +
+                    // current) so the text-only backend never sees media; observations are
+                    // injected only for the current turn.
+                    log.LogInformation("[{RequestId}] BRIDGE rewrite obsMsgCount={ObsCount} keys={Keys} obsHead={Head} obsTail={Tail}", requestId, observations.Count, string.Join(",", observations.Keys),
+                        string.Join(" ||| ", observations.Values.Select(v => v.Length > 120 ? v[..120] : v)),
+                        string.Join(" ||| ", observations.Values.Select(v => v.Length > 200 ? v[^200..] : v)));
+                    forwardBody = JsonBodyRewriter.TryRewriteMedia(body, media, observations, multimodal)
+                                  ?? throw new InvalidOperationException("media rewrite failed");
+                    metrics.RewriteOk();
+
+                    // === Verbose rewritten-body logging: exactly what the text model receives ===
+                    if (opts.VerboseRewrites)
                     {
-                        log.LogInformation("[{RequestId}] BRIDGE rewrite obsMsgCount={ObsCount} keys={Keys} obsHead={Head} obsTail={Tail}", requestId, observations.Count, string.Join(",", observations.Keys),
-                            string.Join(" ||| ", observations.Values.Select(v => v.Length > 120 ? v[..120] : v)),
-                            string.Join(" ||| ", observations.Values.Select(v => v.Length > 200 ? v[^200..] : v)));
-                        forwardBody = JsonBodyRewriter.TryRewriteMedia(body, media, observations, multimodal)
-                                      ?? throw new InvalidOperationException("media rewrite failed");
-
-                        // === Verbose rewritten-body logging: exactly what the text model receives ===
-                        if (opts.VerboseRewrites)
+                        string pretty;
+                        try
                         {
-                            string pretty;
-                            try
-                            {
-                                using var doc = JsonDocument.Parse(forwardBody);
-                                pretty = JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
-                            }
-                            catch
-                            {
-                                pretty = forwardBody;
-                            }
-
-                            var preview = pretty.Length > 6000 ? pretty[..6000] + "\n...<truncated>" : pretty;
-                            log.LogWarning("[{RequestId}] FORWARD:\n{Body}", requestId, preview);
+                            using var doc = JsonDocument.Parse(forwardBody);
+                            pretty = JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
+                        }
+                        catch
+                        {
+                            pretty = forwardBody;
                         }
 
-                        // Also include "image" for the header even if we only have images (existing behavior)
-                        if (mediaKinds.Count == 0)
-                            mediaKinds.Add("image");
+                        var preview = pretty.Length > 6000 ? pretty[..6000] + "\n...<truncated>" : pretty;
+                        log.LogWarning("[{RequestId}] FORWARD:\n{Body}", requestId, preview);
                     }
+
+                    // Also include "image" for the header even if we only have images (existing behavior)
+                    if (mediaKinds.Count == 0)
+                        mediaKinds.Add("image");
                 }
+            }
+
+            // === Observation block for the response ===
+            // The request-side injection is ephemeral (clients store raw history), so the
+            // observation is ALSO appended to the response as a gated block — it lands inside
+            // the assistant message the client persists, making it durable for later turns
+            // without ever re-detouring historical media.
+            string? observationBlock = null;
+            if (observations.Count > 0)
+            {
+                // Escape triple-asterisk sequences in observation text so an adversarial image
+                // cannot make the vision model emit the end delimiter and break the gated region.
+                var escaped = string.Join("\n", observations.Values.Select(v => v.Replace("***", "** *")));
+                observationBlock = $"{multimodal.ObservationBlockStart}\n{escaped}\n{multimodal.ObservationBlockEnd}";
+                log.LogInformation("[{RequestId}] BRIDGE response block chars={Chars}", requestId, observationBlock.Length);
             }
 
             // === Pass-through: body is forwarded as-is ===
@@ -567,7 +589,26 @@ public class Program
 
                 try
                 {
-                    await responseStream.CopyToAsync(ctx.Response.Body, ctx.RequestAborted);
+                    if (observationBlock != null)
+                    {
+                        var isStreaming = JsonFieldReader.TryReadTopLevelBool(body, "stream") ?? false;
+                        if (isStreaming)
+                        {
+                            await SseObservationInjector.InjectAsync(responseStream, ctx.Response.Body, observationBlock, ctx.RequestAborted);
+                        }
+                        else
+                        {
+                            var full = await new StreamReader(responseStream, Encoding.UTF8).ReadToEndAsync(ctx.RequestAborted);
+                            var rewritten = JsonBodyRewriter.TryAppendObservationToJson(full, observationBlock);
+                            if (rewritten == null)
+                                log.LogWarning("[{RequestId}] BRIDGE response block append FAILED (non-streaming) — observation not persisted", requestId);
+                            await ctx.Response.WriteAsync(rewritten ?? full, ctx.RequestAborted);
+                        }
+                    }
+                    else
+                    {
+                        await responseStream.CopyToAsync(ctx.Response.Body, ctx.RequestAborted);
+                    }
                 }
                 catch (Exception streamEx) when (!streamEx.IsOperationCanceled())
                 {

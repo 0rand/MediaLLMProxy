@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "recipe": {
+    "name": ".NET solution (dotnet build + test + proxy boot)",
+    "kind": "dotnet",
+    "bootstrap": [],
+    "build": [
+      "dotnet build OAIPreRouter.Cli -c Release"
+    ],
+    "test": [
+      "dotnet test OAIPreRouter.Tester -c Release"
+    ],
+    "start": "RoutingOptions__ListenUrl=http://127.0.0.1:17071 dotnet run --project OAIPreRouter.Cli -c Release --no-build",
+    "port": 17071,
+    "readinessPath": "/health",
+    "evidence": [
+      "Manual override: .NET 10 SDK project (OAIPreRouter.Cli + OAIPreRouter.Tester); docker-compose recipe was wrong (no Docker daemon on this host)"
+    ]
+  },
+  "updatedAt": "2026-08-26T13:30:00.000000+00:00"
+}

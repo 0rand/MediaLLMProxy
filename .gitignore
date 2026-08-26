@@ -399,3 +399,6 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Uno local ops runbook (INTERNAL — machine-specific paths, never publish)
+docs/uno-local-ops.md
