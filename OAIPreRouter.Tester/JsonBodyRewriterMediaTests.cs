@@ -342,4 +342,31 @@ public class JsonBodyRewriterMediaTests
         // No observation marker in output
         Assert.DoesNotContain("[UNTRUSTED OBSERVATION]:", result!);
     }
+
+    [Fact]
+    public void MixedGates_PassthroughMediaSurvives_DetouredMediaStripped()
+    {
+        // Passthrough mode (DetourVision=false, DetourAudio=true): the rewrite receives ONLY
+        // open-gate parts (audio here). The image part must SURVIVE RAW for the natively
+        // multimodal primary backend; the audio part is stripped.
+        var input = "{\"messages\":[{\"role\":\"user\",\"content\":[" +
+                    "{\"type\":\"text\",\"text\":\"look at this\"}," +
+                    "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAAA\"}}," +
+                    "{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"QUFB\",\"format\":\"wav\"}}]}]}";
+        var parts = new List<MediaContentScanner.MediaPart>
+        {
+            new(MediaContentScanner.MediaKind.Audio, 0, 2, "data:audio/wav;base64,QUFB")
+        };
+        var observations = new Dictionary<int, string>();
+        var opts = DefaultOpts();
+
+        var result = JsonBodyRewriter.TryRewriteMedia(input, parts, observations, opts);
+
+        Assert.NotNull(result);
+        // Audio stripped + placeholder… but the image data URL must still be there
+        Assert.Contains("data:image/png;base64,AAAA", result!);
+        // And the scheduled media (audio payload) must be gone
+        Assert.DoesNotContain("input_audio", result);
+        Assert.DoesNotContain("QUFB", result);
+    }
 }

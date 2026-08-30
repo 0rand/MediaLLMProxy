@@ -220,6 +220,8 @@ Everything is environment variables (`.NET` config binding) or
 | `RoutingOptions__PrimaryBackend__TopP` | text sampling override — forced on every request, beats client values (null = leave client's) |
 | `MultimodalOptions__Enabled` | master bridge switch |
 | `MultimodalOptions__VisionBackend__BaseUrl` | primary vision detour endpoint |
+| `MultimodalOptions__DetourVision` | true (default) = detour images/video to the vision backend, text model receives an observation. **false = passthrough**: media stays RAW in the request for a natively multimodal primary (GLM-5.3, Omni); observation flow skipped, `PrimaryBackend.Temperature/TopP` still forced |
+| `MultimodalOptions__DetourAudio` | true (default) = detour audio to STT, transcript goes to the text model. false = passthrough (primary must accept input_audio natively) |
 | `MultimodalOptions__VisionBackend__ApiKey` | primary vision API token (omit for unauthenticated local inference) |
 | `MultimodalOptions__VisionModel` | primary vision model id |
 | `MultimodalOptions__VisionFallbackBackend__BaseUrl` | optional failure-only fallback vision endpoint |
@@ -325,6 +327,38 @@ values on every request to that backend — the client cannot override them.
   ```
 
 - **Null (default) = leave the client's / backend's value untouched.**
+
+### Native-vision passthrough mode (natively multimodal primary models)
+
+When your primary backend itself has vision (GLM-5.3-Flash NVFP4, Qwen3.8-Omni,
+a Gemini-class cloud model), a detour is the wrong shape: the media would be
+described by a *worse* model and fed to a *better* one as text. Set
+`MultimodalOptions__DetourVision=false` and media flows through untouched:
+
+```bash
+export MultimodalOptions__DetourVision=false
+# the temperature trap: Hermes forces 1.0 for custom providers — force it back:
+export RoutingOptions__PrimaryBackend__Temperature=0.4
+export RoutingOptions__PrimaryBackend__TopP=0.4
+```
+
+What happens then:
+
+- No vision/STT detour, no observation injection, no media rewrite — the
+  client's original media parts reach the primary backend byte-for-byte.
+- The **sampling overrides still apply** (they are applied to the body before
+  the multimodal block), so the proxy remains the place where sampling is
+  pinned — no client, gateway, or framework can override it.
+- Mixed media is handled per-kind: with `DetourVision=false, DetourAudio=true`,
+  images pass raw while audio is still transcribed and injected as text.
+- Gated observation blocks already in client history are unrelated history —
+  passthrough never re-detours anything, it simply stops looking at media.
+- `/health` reports the gate state (`detourVision`, `detourAudio`).
+
+Failure modes to know about: if the primary is NOT natively multimodal,
+passthrough will send it media parts it cannot parse (451/400 from the
+backend, or silent refusal) — that's the deployment telling you the gate is
+mismatched, not a proxy bug.
 
 ### API keys for cloud models
 

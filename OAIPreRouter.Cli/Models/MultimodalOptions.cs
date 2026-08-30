@@ -20,6 +20,21 @@ public record MultimodalOptions
     /// vision backend as-is (backend must accept video natively — e.g. mlx-vlm qwen3_5/qwen3_5_moe).</summary>
     public bool VideoSupport { get; init; } = false;
 
+    /// <summary>When true (default), image/video media is DETOURED to the vision backend and the text
+    /// backend receives a text observation. When false, media passes through RAW to the primary backend —
+    /// the primary model must be natively multimodal (e.g. GLM-5.3, Qwen3.8-Omni). Passthrough skips the
+    /// vision detour, the observation injection, AND the media rewrite; sampling overrides
+    /// (RoutingOptions.PrimaryBackend.Temperature/TopP) still apply to the forwarded body.
+    /// Rationale: Hermes hardcodes temperature for custom providers; forcing it at the proxy is the only
+    /// lever — and a detour would bypass the primary model's native vision entirely.</summary>
+    public bool DetourVision { get; init; } = true;
+
+    /// <summary>When true (default), audio parts are detoured to the STT backend (AudioBackend) and the
+    /// text backend receives a transcript observation. When false, audio passes through RAW to the
+    /// primary backend (which must accept input_audio natively, e.g. an Omni model). Same passthrough
+    /// semantics as DetourVision: no detour, no rewrite, sampling overrides still apply.</summary>
+    public bool DetourAudio { get; init; } = true;
+
     public BackendConfig VisionBackend { get; init; } = new() { BaseUrl = "http://localhost:8000" };
     public string VisionModel { get; init; } = "Qwen3.6-35B-A3B-MLX-VL-oQ8";
 

@@ -95,6 +95,8 @@ public class Program
 
         log.LogInformation("Multimodal bridge: enabled={Enabled}{VisionDetails}", multimodal.Enabled,
             multimodal.Enabled ? $" (vision via {multimodal.VisionBackend.BaseUrl}, model {multimodal.VisionModel}; audio via {multimodal.AudioBackend.BaseUrl})" : "");
+        log.LogInformation("Detour gates: vision={DetourVision} audio={DetourAudio} videoSupport={VideoSupport} (false = passthrough to primary; primary must be natively multimodal)",
+            multimodal.DetourVision, multimodal.DetourAudio, multimodal.VideoSupport);
 
         app.MapPost("v1/chat/completions", HandleChatCompletion);
         app.MapPost("chat/completions", HandleChatCompletion);
@@ -111,8 +113,8 @@ public class Program
                 systemPromptThresholdBytes = options.SystemPromptThresholdBytes,
                 fastLaneThresholdBytes = options.FastLaneThresholdBytes,
                 bridge = multimodal.Enabled
-                    ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, metrics = (object?)metrics.Snapshot() }
-                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, metrics = (object?)null }
+                    ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, metrics = (object?)metrics.Snapshot() }
+                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, metrics = (object?)null }
             });
         });
 
@@ -268,19 +270,35 @@ public class Program
                 {
                     metrics.Scan();
 
+                    // Per-kind detour gates. DetourVision=false → image/video pass through RAW
+                    // (primary model is natively multimodal — e.g. GLM-5.3); DetourAudio=false →
+                    // audio passes through RAW. Passthrough parts skip detour AND rewrite; the
+                    // sampling override block above already rewrote `body` in place, so forcing
+                    // both temperature and top_p still applies on the passthrough path.
+                    var detourVision = multimodal.DetourVision;
+                    var detourAudio = multimodal.DetourAudio;
+
                     // ONLY the last message (the current turn) is detoured. Media in earlier
                     // messages is history: its observations are already durable in the
                     // conversation (gated blocks appended to prior responses), so it is stripped
-                    // but never re-detoured — no vision-model reloads on history reprocessing.
+                    // only when behind an OPEN gate — media behind a CLOSED gate passes through
+                    // raw as payload and must never be rewritten away.
                     var currentMedia = MediaContentScanner.LastTurnMedia(body, media);
                     var historyMediaCount = media.Count - currentMedia.Count;
                     if (historyMediaCount > 0)
                         log.LogInformation("[{RequestId}] BRIDGE history media skipped={Count} (only last turn is detoured)", requestId, historyMediaCount);
 
                     // Separate media by kind (current turn only — history is never detoured)
-                    var imageParts = currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Image).ToList();
-                    var videoParts = currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Video).ToList();
-                    var audioParts = currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Audio).ToList();
+                    var imageParts = detourVision ? currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Image).ToList() : new();
+                    var videoParts = detourVision && multimodal.VideoSupport ? currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Video).ToList() : new();
+                    var audioParts = detourAudio ? currentMedia.Where(p => p.Kind == MediaContentScanner.MediaKind.Audio).ToList() : new();
+
+                    // Media behind an OPEN gate (any position) participates in the rewrite: it is
+                    // stripped and (current turn only) replaced by an observation. Media behind a
+                    // CLOSED gate stays in the body as raw payload.
+                    var behindOpenGate = media.Where(m =>
+                        ((m.Kind == MediaContentScanner.MediaKind.Image || m.Kind == MediaContentScanner.MediaKind.Video) && detourVision) ||
+                        (m.Kind == MediaContentScanner.MediaKind.Audio && detourAudio)).ToList();
 
                     // Process images (existing vision detour path)
                     if (imageParts.Count > 0)
@@ -495,36 +513,50 @@ public class Program
                             mediaKinds.Add(kind);
                     }
 
-                    // Always rewrite when media is present: strip ALL media parts (history +
-                    // current) so the text-only backend never sees media; observations are
-                    // injected only for the current turn.
-                    log.LogInformation("[{RequestId}] BRIDGE rewrite obsMsgCount={ObsCount} keys={Keys} obsHead={Head} obsTail={Tail}", requestId, observations.Count, string.Join(",", observations.Keys),
-                        string.Join(" ||| ", observations.Values.Select(v => v.Length > 120 ? v[..120] : v)),
-                        string.Join(" ||| ", observations.Values.Select(v => v.Length > 200 ? v[^200..] : v)));
-                    forwardBody = JsonBodyRewriter.TryRewriteMedia(body, media, observations, multimodal)
-                                  ?? throw new InvalidOperationException("media rewrite failed");
-                    metrics.RewriteOk();
-
-                    // === Verbose rewritten-body logging: exactly what the text model receives ===
-                    if (opts.VerboseRewrites)
+                    // Rewrite ONLY when open-gate media exists: strip open-gate media parts
+                    // (history + current), observations for the current turn. Closed-gate media
+                    // (passthrough) stays in the body untouched — destroying it would break
+                    // native multimodal handling on the backend (GLM-5.3 / Omni path).
+                    if (behindOpenGate.Count > 0)
                     {
-                        string pretty;
-                        try
-                        {
-                            using var doc = JsonDocument.Parse(forwardBody);
-                            pretty = JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
-                        }
-                        catch
-                        {
-                            pretty = forwardBody;
-                        }
+                        log.LogInformation("[{RequestId}] BRIDGE rewrite obsMsgCount={ObsCount} keys={Keys} obsHead={Head} obsTail={Tail}", requestId, observations.Count, string.Join(",", observations.Keys),
+                            string.Join(" ||| ", observations.Values.Select(v => v.Length > 120 ? v[..120] : v)),
+                            string.Join(" ||| ", observations.Values.Select(v => v.Length > 200 ? v[^200..] : v)));
+                        forwardBody = JsonBodyRewriter.TryRewriteMedia(body, behindOpenGate, observations, multimodal)
+                                      ?? throw new InvalidOperationException("media rewrite failed");
+                        metrics.RewriteOk();
 
-                        var preview = pretty.Length > 6000 ? pretty[..6000] + "\n...<truncated>" : pretty;
-                        log.LogWarning("[{RequestId}] FORWARD:\n{Body}", requestId, preview);
+                        // === Verbose rewritten-body logging: exactly what the text model receives ===
+                        if (opts.VerboseRewrites)
+                        {
+                            string pretty;
+                            try
+                            {
+                                using var doc = JsonDocument.Parse(forwardBody);
+                                pretty = JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
+                            }
+                            catch
+                            {
+                                pretty = forwardBody;
+                            }
+
+                            var preview = pretty.Length > 6000 ? pretty[..6000] + "\n...<truncated>" : pretty;
+                            log.LogWarning("[{RequestId}] FORWARD:\n{Body}", requestId, preview);
+                        }
+                    }
+                    else
+                    {
+                        // Full passthrough: no open-gate media anywhere — body (with raw media
+                        // parts) forwards as-is. Sampling overrides were already applied to
+                        // `body` above, so temperature/top_p forcing still holds.
+                        log.LogInformation("[{RequestId}] BRIDGE passthrough: vision={DetourVision} audio={DetourAudio} media={Count} forwarded raw (sampling override still applies)",
+                            requestId, detourVision, detourAudio, media.Count);
                     }
 
-                    // Also include "image" for the header even if we only have images (existing behavior)
-                    if (mediaKinds.Count == 0)
+                    // Header fallback: when every media part is passthrough (no open-gate media),
+                    // the kinds list is already accurate from the scan above — only fall back to
+                    // "image" when the scan saw media but produced no kinds (defensive).
+                    if (mediaKinds.Count == 0 && media.Count == 0)
                         mediaKinds.Add("image");
                 }
             }
