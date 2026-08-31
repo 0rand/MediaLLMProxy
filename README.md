@@ -155,6 +155,12 @@ gateway. Behavior:
 
 Hermes gotchas:
 
+- **CLI/provider selection**: use `--provider MEDIAPROXY -m main` (two flags).
+  The slug form `-m MEDIAPROXY/main` does NOT resolve for custom providers in
+  current Hermes — it is treated as one model id and silently falls back to the
+  default provider's URL (HTTP 404 "The model \`provider/model\` does not
+  exist"). The `/model` picker and Desktop UI select provider and model
+  separately, so they are unaffected.
 - `vision: auto` semantics (Primo-tested): the vision MCP **never fires** when
   the main model declares `supports_vision: true` — and there is **no auxiliary
   fallback**: if the main model is text-only, vision fails. Keep an explicit
