@@ -369,4 +369,194 @@ public class JsonBodyRewriterMediaTests
         Assert.DoesNotContain("input_audio", result);
         Assert.DoesNotContain("QUFB", result);
     }
+
+    // ─── Tool-media re-home (DeepSeek-style backends: images in user messages only) ───────────
+
+    private const string ToolImageBody = "{\"messages\":[" +
+        "{\"role\":\"user\",\"content\":\"look at this\"}," +
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"vision_analyze\",\"arguments\":\"{}\"}}]}," +
+        "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"Image loaded — answer.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,THEPIXELS\"}}]}]}";
+
+    private static List<MediaContentScanner.MediaPart> ToolImageMedia() =>
+        new() { new(MediaContentScanner.MediaKind.Image, 2, 1, "data:image/png;base64,THEPIXELS") };
+
+    [Fact]
+    public void Rehome_ToolImage_MovedToUserMessageAfterToolResult()
+    {
+        var opts = DefaultOpts() with { RehomeToolMedia = true };
+        var result = JsonBodyRewriter.TryRewriteMedia(ToolImageBody, new List<MediaContentScanner.MediaPart>(),
+            new Dictionary<int, string>(), opts, ToolImageMedia());
+
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var messages = doc.RootElement.GetProperty("messages");
+
+        // policy + user + assistant + tool + rehomed-user
+        Assert.Equal(5, messages.GetArrayLength());
+
+        // assistant tool_calls preserved
+        Assert.True(messages[2].TryGetProperty("tool_calls", out _));
+
+        // tool message: text kept, image stripped
+        var tool = messages[3];
+        Assert.Equal("tool", tool.GetProperty("role").GetString());
+        var toolContent = tool.GetProperty("content");
+        Assert.Equal(1, toolContent.GetArrayLength());
+        Assert.Equal("Image loaded — answer.", toolContent[0].GetProperty("text").GetString());
+
+        // rehomed user message: marker + persist prompt + the image byte-for-byte
+        var rehomed = messages[4];
+        Assert.Equal("user", rehomed.GetProperty("role").GetString());
+        var rehomedContent = rehomed.GetProperty("content");
+        Assert.Equal(3, rehomedContent.GetArrayLength());
+        Assert.Contains("REHOMED", rehomedContent[0].GetProperty("text").GetString());
+        Assert.Contains("description", rehomedContent[1].GetProperty("text").GetString());
+        Assert.Equal("data:image/png;base64,THEPIXELS",
+            rehomedContent[2].GetProperty("image_url").GetProperty("url").GetString());
+
+        // pixels appear exactly once in the whole body
+        Assert.Equal(1, CountOccurrences(result!, "THEPIXELS"));
+    }
+
+    [Fact]
+    public void Rehome_ToolImageOnly_PlaceholderPointsAtRehomedUser()
+    {
+        var body = ToolImageBody.Replace("{\"type\":\"text\",\"text\":\"Image loaded — answer.\"},", "");
+        var opts = DefaultOpts() with { RehomeToolMedia = true };
+        var result = JsonBodyRewriter.TryRewriteMedia(body, new List<MediaContentScanner.MediaPart>(),
+            new Dictionary<int, string>(), opts,
+            new List<MediaContentScanner.MediaPart> { new(MediaContentScanner.MediaKind.Image, 2, 0, "data:image/png;base64,THEPIXELS") });
+
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var messages = doc.RootElement.GetProperty("messages");
+        Assert.Equal(5, messages.GetArrayLength());
+
+        var toolContent = messages[3].GetProperty("content");
+        Assert.Equal(1, toolContent.GetArrayLength());
+        Assert.Contains("rehomed to user message", toolContent[0].GetProperty("text").GetString());
+
+        var rehomedContent = messages[4].GetProperty("content");
+        Assert.Equal(3, rehomedContent.GetArrayLength());
+        Assert.Equal("data:image/png;base64,THEPIXELS",
+            rehomedContent[2].GetProperty("image_url").GetProperty("url").GetString());
+    }
+
+    [Fact]
+    public void Rehome_PersistPromptDisabled_MarkerAndMediaOnly()
+    {
+        var opts = DefaultOpts() with { RehomeToolMedia = true, RehomePersistPrompt = "" };
+        var result = JsonBodyRewriter.TryRewriteMedia(ToolImageBody, new List<MediaContentScanner.MediaPart>(),
+            new Dictionary<int, string>(), opts, ToolImageMedia());
+
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var messages = doc.RootElement.GetProperty("messages");
+        var rehomedContent = messages[4].GetProperty("content");
+        Assert.Equal(2, rehomedContent.GetArrayLength()); // marker + image only
+        Assert.Equal("data:image/png;base64,THEPIXELS",
+            rehomedContent[1].GetProperty("image_url").GetProperty("url").GetString());
+    }
+
+    [Fact]
+    public void Rehome_TwoImagesInOneToolMessage_BothMovedInOrder()
+    {
+        var body = "{\"messages\":[" +
+            "{\"role\":\"user\",\"content\":\"look\"}," +
+            "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":[" +
+            "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAA\"}}," +
+            "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,BBB\"}}]}]}";
+        var media = new List<MediaContentScanner.MediaPart>
+        {
+            new(MediaContentScanner.MediaKind.Image, 1, 0, "data:image/png;base64,AAA"),
+            new(MediaContentScanner.MediaKind.Image, 1, 1, "data:image/png;base64,BBB")
+        };
+        var opts = DefaultOpts() with { RehomeToolMedia = true };
+
+        var result = JsonBodyRewriter.TryRewriteMedia(body, new List<MediaContentScanner.MediaPart>(),
+            new Dictionary<int, string>(), opts, media);
+
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var messages = doc.RootElement.GetProperty("messages");
+        Assert.Equal(4, messages.GetArrayLength()); // policy + user + tool + rehomed-user
+
+        var rehomedContent = messages[3].GetProperty("content");
+        Assert.Equal(4, rehomedContent.GetArrayLength()); // marker + persist prompt + 2 images
+        Assert.Equal("data:image/png;base64,AAA",
+            rehomedContent[2].GetProperty("image_url").GetProperty("url").GetString());
+        Assert.Equal("data:image/png;base64,BBB",
+            rehomedContent[3].GetProperty("image_url").GetProperty("url").GetString());
+    }
+
+    [Fact]
+    public void Rehome_Disabled_ToolImageStaysPut()
+    {
+        var opts = DefaultOpts(); // RehomeToolMedia = false
+        var result = JsonBodyRewriter.TryRewriteMedia(ToolImageBody, new List<MediaContentScanner.MediaPart>(),
+            new Dictionary<int, string>(), opts, null);
+
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var messages = doc.RootElement.GetProperty("messages");
+
+        // policy + user + assistant + tool — no injected user message
+        Assert.Equal(4, messages.GetArrayLength());
+        Assert.Equal(2, messages[3].GetProperty("content").GetArrayLength()); // text + image both stay
+        Assert.Contains("THEPIXELS", result!);
+        Assert.DoesNotContain("REHOMED", result);
+    }
+
+    [Fact]
+    public void Rehome_MixedGates_ToolImageRehomedWhileAudioDetoured()
+    {
+        // DetourVision=false, DetourAudio=true: the image is passthrough (rehomed), the audio is
+        // open-gate (stripped + observed) — both inside the SAME tool message.
+        var body = "{\"messages\":[" +
+            "{\"role\":\"user\",\"content\":\"look\"}," +
+            "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"vision_analyze\",\"arguments\":\"{}\"}}]}," +
+            "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":[" +
+            "{\"type\":\"text\",\"text\":\"Image loaded.\"}," +
+            "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,THEPIXELS\"}}," +
+            "{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"QUFB\",\"format\":\"wav\"}}]}]}";
+        var allMedia = new List<MediaContentScanner.MediaPart>
+        {
+            new(MediaContentScanner.MediaKind.Image, 2, 1, "data:image/png;base64,THEPIXELS"),
+            new(MediaContentScanner.MediaKind.Audio, 2, 2, "data:audio/wav;base64,QUFB")
+        };
+        var openGate = new List<MediaContentScanner.MediaPart> { allMedia[1] };
+        var observations = new Dictionary<int, string> { [2] = "transcript here" };
+        var opts = DefaultOpts() with { RehomeToolMedia = true };
+
+        var result = JsonBodyRewriter.TryRewriteMedia(body, openGate, observations, opts, allMedia);
+
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var messages = doc.RootElement.GetProperty("messages");
+        Assert.Equal(5, messages.GetArrayLength()); // policy + user + assistant + tool + rehomed-user
+
+        var toolContent = messages[3].GetProperty("content");
+        Assert.Equal(2, toolContent.GetArrayLength()); // text + observation
+        Assert.DoesNotContain("input_audio", result);
+        Assert.DoesNotContain("QUFB", result);
+        Assert.Contains("transcript here", result);
+
+        var rehomedContent = messages[4].GetProperty("content");
+        Assert.Equal(3, rehomedContent.GetArrayLength()); // marker + persist prompt + image
+        Assert.Equal("data:image/png;base64,THEPIXELS",
+            rehomedContent[2].GetProperty("image_url").GetProperty("url").GetString());
+        Assert.Equal(1, CountOccurrences(result!, "THEPIXELS"));
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var idx = 0;
+        while ((idx = haystack.IndexOf(needle, idx, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            idx += needle.Length;
+        }
+        return count;
+    }
 }

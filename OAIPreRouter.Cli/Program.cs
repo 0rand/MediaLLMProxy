@@ -95,8 +95,8 @@ public class Program
 
         log.LogInformation("Multimodal bridge: enabled={Enabled}{VisionDetails}", multimodal.Enabled,
             multimodal.Enabled ? $" (vision via {multimodal.VisionBackend.BaseUrl}, model {multimodal.VisionModel}; audio via {multimodal.AudioBackend.BaseUrl})" : "");
-        log.LogInformation("Detour gates: vision={DetourVision} audio={DetourAudio} videoSupport={VideoSupport} (false = passthrough to primary; primary must be natively multimodal)",
-            multimodal.DetourVision, multimodal.DetourAudio, multimodal.VideoSupport);
+        log.LogInformation("Detour gates: vision={DetourVision} audio={DetourAudio} videoSupport={VideoSupport} rehomeToolMedia={RehomeToolMedia} (false = passthrough to primary; primary must be natively multimodal)",
+            multimodal.DetourVision, multimodal.DetourAudio, multimodal.VideoSupport, multimodal.RehomeToolMedia);
 
         app.MapPost("v1/chat/completions", HandleChatCompletion);
         app.MapPost("chat/completions", HandleChatCompletion);
@@ -113,8 +113,8 @@ public class Program
                 systemPromptThresholdBytes = options.SystemPromptThresholdBytes,
                 fastLaneThresholdBytes = options.FastLaneThresholdBytes,
                 bridge = multimodal.Enabled
-                    ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, metrics = (object?)metrics.Snapshot() }
-                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, metrics = (object?)null }
+                    ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)metrics.Snapshot() }
+                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)null }
             });
         });
 
@@ -299,6 +299,15 @@ public class Program
                     var behindOpenGate = media.Where(m =>
                         ((m.Kind == MediaContentScanner.MediaKind.Image || m.Kind == MediaContentScanner.MediaKind.Video) && detourVision) ||
                         (m.Kind == MediaContentScanner.MediaKind.Audio && detourAudio)).ToList();
+
+                    // Tool-message re-home candidates: media inside role:"tool" messages that is NOT
+                    // behind an open gate. Such media is legal for OpenAI/Anthropic backends but the
+                    // DeepSeek vLLM template rejects it (HTTP 400 "Images are supported in user
+                    // messages only") — the rewrite moves it into a fresh user message.
+                    var toolMedia = multimodal.RehomeToolMedia
+                        ? MediaContentScanner.ToolMedia(body, media)
+                        : new List<MediaContentScanner.MediaPart>();
+                    var rehomeCandidates = toolMedia.Except(behindOpenGate).ToList();
 
                     // Process images (existing vision detour path)
                     if (imageParts.Count > 0)
@@ -513,16 +522,24 @@ public class Program
                             mediaKinds.Add(kind);
                     }
 
-                    // Rewrite ONLY when open-gate media exists: strip open-gate media parts
-                    // (history + current), observations for the current turn. Closed-gate media
-                    // (passthrough) stays in the body untouched — destroying it would break
+                    // Rewrite when (a) open-gate media exists (strip + observe) or (b) tool media
+                    // needs re-homing to a user message (DeepSeek-style backends). Closed-gate media
+                    // in USER messages still passes through untouched — destroying it would break
                     // native multimodal handling on the backend (GLM-5.3 / Omni path).
-                    if (behindOpenGate.Count > 0)
+                    if (behindOpenGate.Count > 0 || rehomeCandidates.Count > 0)
                     {
+                        if (rehomeCandidates.Count > 0)
+                        {
+                            metrics.RehomeOk();
+                            log.LogInformation("[{RequestId}] BRIDGE rehome tool→user parts={Count} (backend accepts media in user messages only)",
+                                requestId, rehomeCandidates.Count);
+                        }
+
                         log.LogInformation("[{RequestId}] BRIDGE rewrite obsMsgCount={ObsCount} keys={Keys} obsHead={Head} obsTail={Tail}", requestId, observations.Count, string.Join(",", observations.Keys),
                             string.Join(" ||| ", observations.Values.Select(v => v.Length > 120 ? v[..120] : v)),
                             string.Join(" ||| ", observations.Values.Select(v => v.Length > 200 ? v[^200..] : v)));
-                        forwardBody = JsonBodyRewriter.TryRewriteMedia(body, behindOpenGate, observations, multimodal)
+                        forwardBody = JsonBodyRewriter.TryRewriteMedia(body, behindOpenGate, observations, multimodal,
+                                        multimodal.RehomeToolMedia ? media : null)
                                       ?? throw new InvalidOperationException("media rewrite failed");
                         metrics.RewriteOk();
 

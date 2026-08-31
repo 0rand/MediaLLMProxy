@@ -14,6 +14,7 @@ public sealed class BridgeMetrics
     private long _rewriteOk;
     private long _sttOk;
     private long _sttFail;
+    private long _rehomeOk;
 
     public void Scan() => Interlocked.Increment(ref _scanCount);
     public void DetourOk() => Interlocked.Increment(ref _detourOk);
@@ -24,6 +25,7 @@ public sealed class BridgeMetrics
     public void RewriteOk() => Interlocked.Increment(ref _rewriteOk);
     public void SttOk() => Interlocked.Increment(ref _sttOk);
     public void SttFail() => Interlocked.Increment(ref _sttFail);
+    public void RehomeOk() => Interlocked.Increment(ref _rehomeOk);
 
     public object Snapshot() => new
     {
@@ -35,6 +37,7 @@ public sealed class BridgeMetrics
         cache_miss = Interlocked.Read(ref _cacheMiss),
         rewrite_ok = Interlocked.Read(ref _rewriteOk),
         stt_ok = Interlocked.Read(ref _sttOk),
-        stt_fail = Interlocked.Read(ref _sttFail)
+        stt_fail = Interlocked.Read(ref _sttFail),
+        rehome_ok = Interlocked.Read(ref _rehomeOk)
     };
 }

@@ -222,6 +222,8 @@ Everything is environment variables (`.NET` config binding) or
 | `MultimodalOptions__VisionBackend__BaseUrl` | primary vision detour endpoint |
 | `MultimodalOptions__DetourVision` | true (default) = detour images/video to the vision backend, text model receives an observation. **false = passthrough**: media stays RAW in the request for a natively multimodal primary (GLM-5.3, Omni); observation flow skipped, `PrimaryBackend.Temperature/TopP` still forced |
 | `MultimodalOptions__DetourAudio` | true (default) = detour audio to STT, transcript goes to the text model. false = passthrough (primary must accept input_audio natively) |
+| `MultimodalOptions__RehomeToolMedia` | false (default) = tool-message media passes through byte-for-byte. **true = media inside `role:"tool"` messages is moved into a fresh `role:"user"` message inserted right after the tool message** — for backends whose chat template only accepts media in user messages (DeepSeek vLLM: *"Images are supported in user messages only"*, HTTP 400). Media stays raw (never described); open-gate (detoured) media is unaffected. `RehomeMarker` configures the note text prepended to the rehomed media |
+| `MultimodalOptions__RehomePersistPrompt` | Instruction part included in the rehomed user message (default: asks the model to write a complete description into its own answer). Clients do not persist tool-result image bytes, so the model's description is the durable record for later turns; empty string disables the instruction |
 | `MultimodalOptions__VisionBackend__ApiKey` | primary vision API token (omit for unauthenticated local inference) |
 | `MultimodalOptions__VisionModel` | primary vision model id |
 | `MultimodalOptions__VisionFallbackBackend__BaseUrl` | optional failure-only fallback vision endpoint |
@@ -359,6 +361,45 @@ Failure modes to know about: if the primary is NOT natively multimodal,
 passthrough will send it media parts it cannot parse (451/400 from the
 backend, or silent refusal) — that's the deployment telling you the gate is
 mismatched, not a proxy bug.
+
+### Tool-message media re-homing (backends that only accept media in user messages)
+
+Some backends' chat templates inject image tokens **only in user turns** —
+DeepSeek vLLM rejects an `image_url` part inside a `role:"tool"` message with
+HTTP 400 ("Images are supported in user messages only"). Agent runtimes like
+Hermes that attach images via a vision *tool* (e.g. `vision_analyze` with a
+natively multimodal main model) produce exactly that shape.
+
+Set `MultimodalOptions__RehomeToolMedia=true` and the proxy moves every
+non-detoured media part found in a `role:"tool"` message into a fresh
+`role:"user"` message inserted immediately after the tool message:
+
+```
+assistant(tool_calls: vision_analyze)
+  → tool(text + image)        ← as sent by the client
+  → tool(text only)+user(marker + image)   ← as forwarded by the proxy
+```
+
+- The media parts are kept **byte-for-byte** (copied from the original body,
+  never re-encoded) — this is still native vision, just in a legal role.
+- The tool message keeps its text parts and gets a placeholder
+  (`[media rehomed to user message …]`) when it had none.
+- Each rehomed user message carries `RehomeMarker` first, then
+  `RehomePersistPrompt` (by default: "include a complete description in your
+  answer") — because clients like Hermes do **not** persist tool-result image
+  bytes (their session DB strips them to `[screenshot]`), the model's own
+  description written into the response is what survives across turns. The
+  pixels are visible only on the turn they are rehomed — like a human glancing
+  at a picture and describing it; ask "look again" and they re-appear.
+- Media in **user** messages is untouched; open-gate (detoured) media is
+  stripped + observed as usual; `RehomeToolMedia` only moves what would
+  otherwise pass through raw inside a tool message.
+- `/health` reports `rehomeToolMedia` and the `rehome_ok` counter.
+
+```bash
+export MultimodalOptions__DetourVision=false   # native vision on the primary
+export MultimodalOptions__RehomeToolMedia=true # DeepSeek-style backend
+```
 
 ### API keys for cloud models
 

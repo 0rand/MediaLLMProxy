@@ -95,6 +95,40 @@ public static class MediaContentScanner
     }
 
     /// <summary>
+    /// Returns only the media parts belonging to role:"tool" messages. Used to decide whether the
+    /// tool-media re-home rewrite (media tool→user) has anything to do. Fail-closed: on parse
+    /// anomaly returns empty, so no tool media → pure passthrough.
+    /// </summary>
+    public static List<MediaPart> ToolMedia(string body, IReadOnlyList<MediaPart> media)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (!doc.RootElement.TryGetProperty("messages", out var messages) ||
+                messages.ValueKind != JsonValueKind.Array)
+                return new List<MediaPart>();
+
+            var toolIndexes = new HashSet<int>();
+            for (var i = 0; i < messages.GetArrayLength(); i++)
+            {
+                var msg = messages[i];
+                if (msg.ValueKind == JsonValueKind.Object &&
+                    msg.TryGetProperty("role", out var r) &&
+                    r.ValueKind == JsonValueKind.String &&
+                    r.GetString() == "tool")
+                {
+                    toolIndexes.Add(i);
+                }
+            }
+            return media.Where(m => toolIndexes.Contains(m.MessageIndex)).ToList();
+        }
+        catch
+        {
+            return new List<MediaPart>();
+        }
+    }
+
+    /// <summary>
     /// Returns only the media parts belonging to the LAST message — the current turn.
     /// Media in earlier messages is history: its observations are already durable in the
     /// conversation (gated blocks appended to prior responses), so it is stripped but never

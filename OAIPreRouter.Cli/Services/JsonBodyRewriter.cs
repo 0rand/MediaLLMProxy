@@ -135,12 +135,18 @@ public static class JsonBodyRewriter
 
     /// <summary>
     /// Rewrites media parts out and observations in, in ONE validated pass.
+    /// When <paramref name="allMedia"/> is provided AND opts.RehomeToolMedia is true, media parts
+    /// found inside role:"tool" messages that are NOT part of <paramref name="parts"/> (i.e. not
+    /// behind an open detour gate) are MOVED into a fresh role:"user" message inserted immediately
+    /// after the tool message — byte-for-byte, so backends that only accept media in user messages
+    /// (DeepSeek vLLM: "Images are supported in user messages only") still see the pixels natively.
     /// Returns null on parse failure (caller then fails closed with 502).
     /// </summary>
     public static string? TryRewriteMedia(string json,
         IReadOnlyList<MediaContentScanner.MediaPart> parts,
         IReadOnlyDictionary<int, string> observationsByMessageIndex,
-        MultimodalOptions opts)
+        MultimodalOptions opts,
+        IReadOnlyList<MediaContentScanner.MediaPart>? allMedia = null)
     {
         try
         {
@@ -184,6 +190,48 @@ public static class JsonBodyRewriter
                     stripSet.Add((part.MessageIndex, part.PartIndex));
                 }
 
+                // Build the re-home map: media parts inside role:"tool" messages that survive the
+                // rewrite (not in stripSet) are moved into a fresh role:"user" message inserted
+                // immediately after the tool message. This is the DeepSeek-shaped backend fix —
+                // those templates only inject images in user turns and 400 on tool-message media.
+                var rehomeByMessageIndex = new Dictionary<int, List<int>>();
+                if (opts.RehomeToolMedia && allMedia != null)
+                {
+                    // First pass: remember which message indexes are role:"tool".
+                    var toolIndexes = new HashSet<int>();
+                    for (var i = 0; i < messagesLength; i++)
+                    {
+                        var m = messagesElem!.Value[i];
+                        if (m.ValueKind == JsonValueKind.Object &&
+                            m.TryGetProperty("role", out var r) &&
+                            r.ValueKind == JsonValueKind.String &&
+                            r.GetString() == "tool")
+                        {
+                            toolIndexes.Add(i);
+                        }
+                    }
+
+                    foreach (var part in allMedia)
+                    {
+                        if (!toolIndexes.Contains(part.MessageIndex))
+                            continue;
+                        if (stripSet.Contains((part.MessageIndex, part.PartIndex)))
+                            continue; // open-gate media: stripped + observed, nothing left to re-home
+                        if (!rehomeByMessageIndex.TryGetValue(part.MessageIndex, out var list))
+                            rehomeByMessageIndex[part.MessageIndex] = list = new List<int>();
+                        if (!list.Contains(part.PartIndex))
+                            list.Add(part.PartIndex);
+                    }
+
+                    // Rehomed parts are STRIPPED from the tool message (they live on in the
+                    // injected user message) — otherwise the pixels would travel twice.
+                    foreach (var kv in rehomeByMessageIndex)
+                    {
+                        foreach (var pi in kv.Value)
+                            stripSet.Add((kv.Key, pi));
+                    }
+                }
+
                 foreach (var prop in doc.RootElement.EnumerateObject())
                 {
                     if (prop.NameEquals("messages"))
@@ -216,7 +264,9 @@ public static class JsonBodyRewriter
                             if (msg.TryGetProperty("content", out var content))
                             {
                                 writer.WritePropertyName("content");
-                                WriteRewrittenContent(writer, content, i, stripSet, observationsByMessageIndex, opts);
+                                WriteRewrittenContent(writer, content, i, stripSet,
+                                    observationsByMessageIndex, opts,
+                                    rehomed: rehomeByMessageIndex.ContainsKey(i));
                             }
                             else
                             {
@@ -233,6 +283,45 @@ public static class JsonBodyRewriter
                             }
 
                             writer.WriteEndObject();
+
+                            // Re-home: emit a fresh role:"user" message carrying the tool message's
+                            // media parts byte-for-byte, so backends that only accept media in user
+                            // messages (DeepSeek vLLM) still receive the pixels natively. The message
+                            // lands immediately after the tool message — protocol-valid: assistant
+                            // tool_calls → tool result → user turn.
+                            if (rehomeByMessageIndex.TryGetValue(i, out var rehomeParts))
+                            {
+                                rehomeParts.Sort();
+                                writer.WriteStartObject();
+                                writer.WriteString("role", "user");
+                                writer.WritePropertyName("content");
+                                writer.WriteStartArray();
+                                writer.WriteStartObject();
+                                writer.WriteString("type", "text");
+                                writer.WriteString("text", opts.RehomeMarker);
+                                writer.WriteEndObject();
+                                // Durable-record instruction: the model writes its own description
+                                // into the answer so the record survives in client history — the
+                                // pixels themselves are only visible on this turn.
+                                if (!string.IsNullOrWhiteSpace(opts.RehomePersistPrompt))
+                                {
+                                    writer.WriteStartObject();
+                                    writer.WriteString("type", "text");
+                                    writer.WriteString("text", opts.RehomePersistPrompt);
+                                    writer.WriteEndObject();
+                                }
+                                if (msg.TryGetProperty("content", out var srcContent) &&
+                                    srcContent.ValueKind == JsonValueKind.Array)
+                                {
+                                    foreach (var pi in rehomeParts)
+                                    {
+                                        if (pi >= 0 && pi < srcContent.GetArrayLength())
+                                            srcContent[pi].WriteTo(writer);
+                                    }
+                                }
+                                writer.WriteEndArray();
+                                writer.WriteEndObject();
+                            }
                         }
 
                         writer.WriteEndArray();
@@ -331,7 +420,8 @@ public static class JsonBodyRewriter
     private static void WriteRewrittenContent(Utf8JsonWriter writer, JsonElement content, int messageIndex,
         HashSet<(int msgIdx, int partIdx)> stripSet,
         IReadOnlyDictionary<int, string> observationsByMessageIndex,
-        MultimodalOptions opts)
+        MultimodalOptions opts,
+        bool rehomed = false)
     {
         if (content.ValueKind == JsonValueKind.String)
         {
@@ -445,12 +535,15 @@ public static class JsonBodyRewriter
             // All parts processed — write the result array
             writer.WriteStartArray();
 
-            // If no parts remain after stripping, add placeholder
+            // If no parts remain after stripping, add placeholder (rehomed messages get a
+            // placeholder pointing at the follow-up user turn instead of the generic removal one)
             if (strippedParts.Count == 0)
             {
                 writer.WriteStartObject();
                 writer.WriteString("type", "text");
-                writer.WriteString("text", "[media removed by proxy]");
+                writer.WriteString("text", rehomed
+                    ? "[media rehomed to user message — see the user turn immediately after this tool result]"
+                    : "[media removed by proxy]");
                 writer.WriteEndObject();
             }
             else

@@ -259,4 +259,31 @@ public class MediaContentScannerTests
         };
         Assert.Empty(MediaContentScanner.LastTurnMedia("{\"model\":\"x\"}", media));
     }
+
+    [Fact]
+    public void ToolMedia_OnlyToolRoleMessages_Returned()
+    {
+        // image in a tool message + image in a user message → only the tool-message part returned
+        var body = "{\"messages\":[" +
+                   "{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAA=\"}}]}," +
+                   "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"vision_analyze\",\"arguments\":\"{}\"}}]}," +
+                   "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,BBB=\"}}]}]}";
+        var media = MediaContentScanner.Scan(body);
+
+        var toolMedia = MediaContentScanner.ToolMedia(body, media);
+
+        Assert.Single(toolMedia);
+        Assert.Equal(2, toolMedia[0].MessageIndex);
+        Assert.Equal(1, toolMedia[0].PartIndex);
+        Assert.Contains("BBB", toolMedia[0].Url);
+    }
+
+    [Fact]
+    public void ToolMedia_NoToolMessages_ReturnsEmpty()
+    {
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAA=\"}}]}]}";
+        var media = MediaContentScanner.Scan(body);
+
+        Assert.Empty(MediaContentScanner.ToolMedia(body, media));
+    }
 }
