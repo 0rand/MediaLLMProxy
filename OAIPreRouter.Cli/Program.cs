@@ -658,6 +658,7 @@ public class Program
                     requestId, (int)upstream.StatusCode, sw.ElapsedMilliseconds, targetUri);
 
                 ctx.Response.StatusCode = (int)upstream.StatusCode;
+                ctx.Response.ContentType = "text/event-stream"; // SSE — clients need it to decode lines (requests.iter_lines(decode_unicode=True) yields bytes without it)
                 ctx.Response.Headers["X-PreRouter-Detect"] = detectionType;
                 ctx.Response.Headers["X-PreRouter-Intended-Lane"] = intendedLane;
                 ctx.Response.Headers["X-PreRouter-Body-Bytes"] = body.Length.ToString();

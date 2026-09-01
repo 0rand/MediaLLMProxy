@@ -430,4 +430,28 @@ public class LoopGuardTests
         Assert.False(judged);
         Assert.Contains("real answer", Encoding.UTF8.GetString(dest.ToArray()));
     }
+
+    [Fact]
+    public async Task Wedge_VllmReasoningField_Triggers()
+    {
+        // vLLM streams reasoning in `reasoning` (not reasoning_content) — must count it too.
+        var chunk = new Dictionary<string, object?>
+        {
+            ["id"] = "chatcmpl-t", ["object"] = "chat.completion.chunk", ["created"] = 1, ["model"] = "m",
+            ["choices"] = new[] { new Dictionary<string, object?> { ["index"] = 0,
+                ["delta"] = new Dictionary<string, object?> { ["reasoning"] = new string('x', 600) },
+                ["finish_reason"] = null } }
+        };
+        var source = StreamOf("data: " + JsonSerializer.Serialize(chunk) + "\n\n" + SseDone());
+        var dest = new MemoryStream();
+        var judged = false;
+
+        await SseWedgeProcessor.ProcessAsync(source, dest, WedgeOpts(),
+            judge: _ => { judged = true; return Task.FromResult(("NUDGE: x", (string?)null)); },
+            makeAttempt2: (_, _, _) => Task.FromResult<Stream?>(null),
+            abortAttempt1: null,
+            CancellationToken.None);
+
+        Assert.True(judged); // 600 chars / 4 = 150 tokens >= 100 threshold
+    }
 }

@@ -140,7 +140,17 @@ public static class LoopGuardService
                 cache.Set(cacheKey, raw);
         }
         if (raw == null) return (null, null);
-        return (ParseVerdict(raw), ParseSummary(raw));
+        var nudge = ParseVerdict(raw);
+        var summary = ParseSummary(raw);
+        if (nudge != null)
+        {
+            Console.WriteLine($"[LOOPGUARD-JUDGE] verdict=NUDGE reasoningChars={capped.Length} nudge={nudge} summary={summary}");
+        }
+        else
+        {
+            Console.WriteLine($"[LOOPGUARD-JUDGE] verdict=NO_LOOP reasoningChars={capped.Length}");
+        }
+        return (nudge, summary);
     }
 
     /// <summary>

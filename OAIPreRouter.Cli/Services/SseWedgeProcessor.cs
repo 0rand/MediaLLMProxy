@@ -145,7 +145,9 @@ public static class SseWedgeProcessor
                     ["delta"] = new Dictionary<string, object?>
                     {
                         ["role"] = "assistant",
-                        ["content"] = "\n\n" + banner
+                        // Banner rides the REASONING block, not content — the answer stays
+                        // clean; the wedge note is part of the thinking narrative.
+                        ["reasoning_content"] = "\n\n" + banner
                     },
                     ["finish_reason"] = null
                 }
@@ -187,8 +189,11 @@ public static class SseWedgeProcessor
                 return;
             var delta = choices[0].TryGetProperty("delta", out var d) ? d : default;
             if (delta.ValueKind != JsonValueKind.Object) return;
+            // vLLM streams reasoning in `reasoning`, llama.cpp/oMLX in `reasoning_content` — count both.
             if (delta.TryGetProperty("reasoning_content", out var rc) && rc.ValueKind == JsonValueKind.String)
                 reasoning.Append(rc.GetString());
+            else if (delta.TryGetProperty("reasoning", out var r) && r.ValueKind == JsonValueKind.String)
+                reasoning.Append(r.GetString());
             if (delta.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String &&
                 !string.IsNullOrEmpty(c.GetString()))
                 hasContent = true;
