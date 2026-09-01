@@ -28,6 +28,7 @@ public class Program
 
         builder.Services.Configure<RoutingOptions>(builder.Configuration.GetSection(RoutingOptions.ConfigSection));
         builder.Services.Configure<MultimodalOptions>(builder.Configuration.GetSection(MultimodalOptions.ConfigSection));
+        builder.Services.Configure<LoopGuardOptions>(builder.Configuration.GetSection(LoopGuardOptions.ConfigSection));
         builder.Services.AddSingleton<ConnectionLimiter>();
         builder.Services.AddSingleton<ObservationCache>();
         builder.Services.AddSingleton<BridgeMetrics>();
@@ -54,6 +55,7 @@ public class Program
         var limiter = app.Services.GetRequiredService<ConnectionLimiter>();
         var log = app.Logger;
         var multimodal = app.Services.GetRequiredService<IOptions<MultimodalOptions>>().Value;
+        var loopGuard = app.Services.GetRequiredService<IOptions<LoopGuardOptions>>().Value;
         var visionDetour = app.Services.GetRequiredService<VisionDetourClient>();
         var sttDetour = app.Services.GetRequiredService<SttDetourClient>();
         var obsCache = app.Services.GetRequiredService<ObservationCache>();
@@ -97,6 +99,8 @@ public class Program
             multimodal.Enabled ? $" (vision via {multimodal.VisionBackend.BaseUrl}, model {multimodal.VisionModel}; audio via {multimodal.AudioBackend.BaseUrl})" : "");
         log.LogInformation("Detour gates: vision={DetourVision} audio={DetourAudio} videoSupport={VideoSupport} rehomeToolMedia={RehomeToolMedia} (false = passthrough to primary; primary must be natively multimodal)",
             multimodal.DetourVision, multimodal.DetourAudio, multimodal.VideoSupport, multimodal.RehomeToolMedia);
+        log.LogInformation("LoopGuard: enabled={Enabled} threshold={Threshold} staticNudge={HasNudge}",
+            loopGuard.Enabled, loopGuard.ReasoningTokenThreshold, !string.IsNullOrWhiteSpace(loopGuard.StaticNudge));
 
         app.MapPost("v1/chat/completions", HandleChatCompletion);
         app.MapPost("chat/completions", HandleChatCompletion);
@@ -114,7 +118,8 @@ public class Program
                 fastLaneThresholdBytes = options.FastLaneThresholdBytes,
                 bridge = multimodal.Enabled
                     ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)metrics.Snapshot() }
-                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)null }
+                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)null },
+                loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, metrics = (object?)metrics.Snapshot() }
             });
         });
 
@@ -593,8 +598,32 @@ public class Program
                 log.LogInformation("[{RequestId}] BRIDGE response block chars={Chars}", requestId, observationBlock.Length);
             }
 
+            // === LoopGuard (stage 1: static nudge on long reasoning) ===
+            // Runs on the FINAL body (after media rewrite). Fail-open: any anomaly → forward
+            // unchanged. Verdict rides the response header for observability.
+            string? loopGuardBody = null;
+            string? loopGuardVerdict = null;
+            if (loopGuard.Enabled)
+            {
+                var target = forwardBody ?? body;
+                var result = LoopGuardService.Evaluate(target, loopGuard);
+                if (result.Body != null)
+                {
+                    loopGuardBody = result.Body;
+                    loopGuardVerdict = result.Verdict;
+                    metrics.LoopGuardCheck();
+                    metrics.LoopGuardNudge();
+                    log.LogInformation("[{RequestId}] LOOPGUARD nudge injected (reasoning threshold {Threshold})",
+                        requestId, loopGuard.ReasoningTokenThreshold);
+                }
+                else if (LoopGuardService.ExtractLastReasoning(target) != null)
+                {
+                    metrics.LoopGuardCheck();
+                }
+            }
+
             // === Pass-through: body is forwarded as-is ===
-            var forwarded = forwardBody ?? body;
+            var forwarded = loopGuardBody ?? forwardBody ?? body;
             using var outbound = new HttpRequestMessage(HttpMethod.Post, targetUri);
             outbound.Content = new StringContent(forwarded, Encoding.UTF8, "application/json");
 
@@ -618,6 +647,8 @@ public class Program
                 ctx.Response.Headers["X-PreRouter-Body-Bytes"] = body.Length.ToString();
                 if (forwardBody != null)
                     ctx.Response.Headers["X-PreRouter-Media"] = string.Join(",", mediaKinds);
+                if (loopGuardVerdict != null)
+                    ctx.Response.Headers["X-PreRouter-LoopGuard"] = loopGuardVerdict;
 
                 foreach (var h in upstream.Headers)
                     ctx.Response.Headers[h.Key] = h.Value.ToArray();

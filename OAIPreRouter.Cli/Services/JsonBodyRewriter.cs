@@ -417,6 +417,98 @@ public static class JsonBodyRewriter
         }
     }
 
+    /// <summary>
+    /// Appends a loop-guard nudge to the LAST user message (string content → appended
+    /// string; array content → appended text part; no user message → new user message
+    /// inserted after the last message). Returns null on parse failure.
+    /// </summary>
+    public static string? TryInjectLoopGuardNudge(string json, string marker, string nudge)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("messages", out var messages) ||
+                messages.ValueKind != JsonValueKind.Array || messages.GetArrayLength() == 0)
+                return null;
+
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                writer.WriteStartObject();
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (!prop.NameEquals("messages")) { prop.WriteTo(writer); continue; }
+                    writer.WritePropertyName("messages");
+                    writer.WriteStartArray();
+                    var lastUserIdx = -1;
+                    for (var i = 0; i < messages.GetArrayLength(); i++)
+                    {
+                        var m = messages[i];
+                        if (m.ValueKind == JsonValueKind.Object &&
+                            m.TryGetProperty("role", out var r) &&
+                            r.ValueKind == JsonValueKind.String && r.GetString() == "user")
+                            lastUserIdx = i;
+                    }
+                    var injected = false;
+                    for (var i = 0; i < messages.GetArrayLength(); i++)
+                    {
+                        var m = messages[i];
+                        if (i == lastUserIdx && !injected)
+                        {
+                            writer.WriteStartObject();
+                            foreach (var mp in m.EnumerateObject())
+                            {
+                                if (mp.NameEquals("content") && mp.Value.ValueKind == JsonValueKind.String)
+                                {
+                                    writer.WritePropertyName("content");
+                                    writer.WriteStringValue(mp.Value.GetString() + "\n\n" + marker + nudge);
+                                }
+                                else if (mp.NameEquals("content") && mp.Value.ValueKind == JsonValueKind.Array)
+                                {
+                                    writer.WritePropertyName("content");
+                                    writer.WriteStartArray();
+                                    foreach (var part in mp.Value.EnumerateArray())
+                                        part.WriteTo(writer);
+                                    writer.WriteStartObject();
+                                    writer.WriteString("type", "text");
+                                    writer.WriteString("text", marker + nudge);
+                                    writer.WriteEndObject();
+                                    writer.WriteEndArray();
+                                }
+                                else
+                                {
+                                    mp.WriteTo(writer);
+                                }
+                            }
+                            writer.WriteEndObject();
+                            injected = true;
+                        }
+                        else
+                        {
+                            m.WriteTo(writer);
+                        }
+                    }
+                    if (!injected)
+                    {
+                        // No user message: insert one after the last message.
+                        writer.WriteStartObject();
+                        writer.WriteString("role", "user");
+                        writer.WritePropertyName("content");
+                        writer.WriteStringValue(marker + nudge);
+                        writer.WriteEndObject();
+                    }
+                    writer.WriteEndArray();
+                }
+                writer.WriteEndObject();
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static void WriteRewrittenContent(Utf8JsonWriter writer, JsonElement content, int messageIndex,
         HashSet<(int msgIdx, int partIdx)> stripSet,
         IReadOnlyDictionary<int, string> observationsByMessageIndex,

@@ -297,6 +297,10 @@ Everything is environment variables (`.NET` config binding) or
 | `MultimodalOptions__DetourAudio` | true (default) = detour audio to STT, transcript goes to the text model. false = passthrough (primary must accept input_audio natively) |
 | `MultimodalOptions__RehomeToolMedia` | false (default) = tool-message media passes through byte-for-byte. **true = media inside `role:"tool"` messages is moved into a fresh `role:"user"` message inserted right after the tool message** — for backends whose chat template only accepts media in user messages (DeepSeek vLLM: *"Images are supported in user messages only"*, HTTP 400). Media stays raw (never described); open-gate (detoured) media is unaffected. `RehomeMarker` configures the note text prepended to the rehomed media |
 | `MultimodalOptions__RehomePersistPrompt` | Instruction part included in the rehomed user message (default: asks the model to write a complete description into its own answer). Clients do not persist tool-result image bytes, so the model's description is the durable record for later turns; empty string disables the instruction |
+| `LoopGuardOptions__Enabled` | false (default). **true = loop guard active**: when the last assistant message's reasoning exceeds the threshold, a nudge is injected into the last user message before forwarding |
+| `LoopGuardOptions__ReasoningTokenThreshold` | Gate: reasoning size estimate (chars/4 ≈ tokens) of the previous assistant message. Default 8192 |
+| `LoopGuardOptions__StaticNudge` | Static nudge text (stage 1 — no advisor model). Default: "You have been thinking for a long time. Please take a step back and provide an output for the smallest first step before continuing." Empty = no-op |
+| `LoopGuardOptions__InjectionMarker` | Marker prepended to the injected nudge (marks it as a system-side note, not a user instruction) |
 | `MultimodalOptions__VisionBackend__ApiKey` | primary vision API token (omit for unauthenticated local inference) |
 | `MultimodalOptions__VisionModel` | primary vision model id |
 | `MultimodalOptions__VisionFallbackBackend__BaseUrl` | optional failure-only fallback vision endpoint |
@@ -473,6 +477,30 @@ assistant(tool_calls: vision_analyze)
 export MultimodalOptions__DetourVision=false   # native vision on the primary
 export MultimodalOptions__RehomeToolMedia=true # DeepSeek-style backend
 ```
+
+### Loop guard (stage 1 — static nudge on long reasoning)
+
+Models sometimes loop: long deliberation, no progress, no tool calls. The
+proxy watches the request and, when the previous assistant message's reasoning
+exceeds a threshold, injects a nudge into the last user message before
+forwarding — steering the model to take a step back and produce the smallest
+first step. No advisor model needed (stage 1); the nudge is static and
+configurable.
+
+```bash
+export LoopGuardOptions__Enabled=true
+export LoopGuardOptions__ReasoningTokenThreshold=8192
+```
+
+Behavior:
+- Gate: last assistant `reasoning_content` size estimate (chars/4) ≥ threshold.
+- Nudge is appended to the LAST user message (string or array content; a new
+  user message is inserted if none exists) with `InjectionMarker` prepended.
+- Fail-open: parse anomalies → request passes through unchanged.
+- Ephemeral: the nudge rides only this request; the client never persists it.
+- Observability: `X-PreRouter-LoopGuard: nudge` response header,
+  `loop_guard_checks` / `loop_guard_nudges` in /health metrics, startup log
+  line, `LOOPGUARD nudge injected` request log.
 
 ### API keys for cloud models
 
