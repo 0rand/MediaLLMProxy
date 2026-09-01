@@ -1,8 +1,8 @@
 # LoopGuard v1 Implementation Plan
 
-> **Status:** STAGE 2 (LLM judge + static fallback) IMPLEMENTED + VERIFIED 2026-09-01 —
-> 178/178 tests; live e2e: real Qwen 3B judge nudge in forwarded body (3.0s), dead-judge
-> static fallback confirmed. Stage 3 (wedge) + subagent/senior tiers pending.
+> **Status:** STAGE 3 (mid-turn wedge) IMPLEMENTED + VERIFIED 2026-09-01 — 190/190 tests;
+> live streaming e2e: reasoning stream → 3B judge (NUDGE+SUMMARY) → thinking-OFF re-issue →
+> banner + answer on the same client stream. Subagent/senior tiers pending.
 
 > **For Hermes:** Implement task-by-task with TDD; commit after each task.
 

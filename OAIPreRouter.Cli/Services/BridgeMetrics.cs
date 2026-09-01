@@ -19,6 +19,8 @@ public sealed class BridgeMetrics
     private long _loopGuardNudges;
     private long _loopGuardErrors;
     private long _loopGuardAdvisorMs;
+    private long _loopGuardWedges;
+    private long _loopGuardWedgeMs;
 
     public void Scan() => Interlocked.Increment(ref _scanCount);
     public void DetourOk() => Interlocked.Increment(ref _detourOk);
@@ -34,6 +36,8 @@ public sealed class BridgeMetrics
     public void LoopGuardNudge() => Interlocked.Increment(ref _loopGuardNudges);
     public void LoopGuardError() => Interlocked.Increment(ref _loopGuardErrors);
     public void LoopGuardAdvisorMs(long ms) => Interlocked.Add(ref _loopGuardAdvisorMs, ms);
+    public void LoopGuardWedge() => Interlocked.Increment(ref _loopGuardWedges);
+    public void LoopGuardWedgeMs(long ms) => Interlocked.Add(ref _loopGuardWedgeMs, ms);
 
     public object Snapshot() => new
     {
@@ -50,6 +54,8 @@ public sealed class BridgeMetrics
         loop_guard_checks = Interlocked.Read(ref _loopGuardChecks),
         loop_guard_nudges = Interlocked.Read(ref _loopGuardNudges),
         loop_guard_errors = Interlocked.Read(ref _loopGuardErrors),
-        loop_guard_advisor_ms = Interlocked.Read(ref _loopGuardAdvisorMs)
+        loop_guard_advisor_ms = Interlocked.Read(ref _loopGuardAdvisorMs),
+        loop_guard_wedges = Interlocked.Read(ref _loopGuardWedges),
+        loop_guard_wedge_ms = Interlocked.Read(ref _loopGuardWedgeMs)
     };
 }

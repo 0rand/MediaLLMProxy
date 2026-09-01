@@ -1,4 +1,5 @@
 using Xunit;
+using System.Text;
 using System.Text.Json;
 using OAIPreRouter.Cli.Services;
 using OAIPreRouter.Cli.Models;
@@ -258,4 +259,175 @@ public class LoopGuardTests
 
     [Fact]
     public void Inject_NoMessages_ReturnsNull() => Assert.Null(JsonBodyRewriter.TryInjectLoopGuardNudge("{\"model\":\"x\"}", "[LG]: ", "stop"));
+
+    // ─── Stage 3: wedge ───────────────────────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData("NUDGE: stop\nSUMMARY: key insight here", "key insight here")]
+    [InlineData("NUDGE: stop\nSUMMARY:  ", null)]
+    [InlineData("NO_LOOP", null)]
+    [InlineData("NUDGE: only nudge", null)]
+    [InlineData(null, null)]
+    public void ParseSummary(string? raw, string? expected)
+    {
+        Assert.Equal(expected, LoopGuardService.ParseSummary(raw));
+    }
+
+    [Fact]
+    public void BuildWedgeBody_ThinkingOff_SummaryMode()
+    {
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}],\"chat_template_kwargs\":{\"thinking\":true,\"reasoning_effort\":\"max\"}}";
+        var opts = DefaultOpts() with { WedgeEnabled = true };
+        var result = LoopGuardService.BuildWedgeBody(body, "stop looping", "key insight", "long reasoning", opts);
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var root = doc.RootElement;
+        var ctk = root.GetProperty("chat_template_kwargs");
+        Assert.False(ctk.GetProperty("thinking").GetBoolean());
+        Assert.False(ctk.TryGetProperty("reasoning_effort", out _));
+        var content = root.GetProperty("messages")[0].GetProperty("content").GetString();
+        Assert.Contains("Key points from your reasoning: key insight", content);
+        Assert.Contains("stop looping", content);
+        Assert.DoesNotContain("long reasoning", content); // summary mode, not verbatim
+    }
+
+    [Fact]
+    public void BuildWedgeBody_VerbatimMode_IncludesReasoning()
+    {
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}]}";
+        var opts = DefaultOpts() with { WedgeEnabled = true, WedgeReasoningMode = "verbatim" };
+        var result = LoopGuardService.BuildWedgeBody(body, null, null, "the raw deliberation", opts);
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var content = doc.RootElement.GetProperty("messages")[0].GetProperty("content").GetString();
+        Assert.Contains("Your previous reasoning (truncated): the raw deliberation", content);
+    }
+
+    [Fact]
+    public void BuildWedgeBody_NoChatTemplateKwargs_AddsThinkingOff()
+    {
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}]}";
+        var opts = DefaultOpts() with { WedgeEnabled = true };
+        var result = LoopGuardService.BuildWedgeBody(body, null, null, null, opts);
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var ctk = doc.RootElement.GetProperty("chat_template_kwargs");
+        Assert.False(ctk.GetProperty("thinking").GetBoolean());
+    }
+
+    // ─── SseWedgeProcessor ────────────────────────────────────────────────────────────────
+
+    private static string SseChunk(string reasoning = "", string? content = null, string? finish = null)
+    {
+        var delta = new Dictionary<string, object?>();
+        if (!string.IsNullOrEmpty(reasoning)) delta["reasoning_content"] = reasoning;
+        if (content != null) delta["content"] = content;
+        var chunk = new Dictionary<string, object?>
+        {
+            ["id"] = "chatcmpl-t", ["object"] = "chat.completion.chunk", ["created"] = 1, ["model"] = "m",
+            ["choices"] = new[] { new Dictionary<string, object?> { ["index"] = 0, ["delta"] = delta, ["finish_reason"] = finish } }
+        };
+        return "data: " + JsonSerializer.Serialize(chunk) + "\n\n";
+    }
+
+    private static string SseDone() => "data: [DONE]\n\n";
+
+    private static MemoryStream StreamOf(string s) => new(Encoding.UTF8.GetBytes(s));
+
+    private static LoopGuardOptions WedgeOpts() => DefaultOpts() with
+    {
+        WedgeEnabled = true,
+        WedgeReasoningTokens = 100, // chars/4 → 400 chars triggers
+        WedgeBanner = "[WEDGE BANNER]"
+    };
+
+    [Fact]
+    public async Task Wedge_Fires_ReissuesAndStreamsBanner()
+    {
+        var source = StreamOf(
+            SseChunk(reasoning: new string('a', 200)) +
+            SseChunk(reasoning: new string('b', 200)) +
+            SseChunk(reasoning: new string('c', 200)) +
+            SseDone());
+        var attempt2 = StreamOf(SseChunk(content: "the answer") + SseDone());
+        var dest = new MemoryStream();
+        var aborted = false;
+
+        await SseWedgeProcessor.ProcessAsync(source, dest, WedgeOpts(),
+            judge: _ => Task.FromResult(("NUDGE: stop", "SUMMARY: key points")),
+            makeAttempt2: (_, _, _) => Task.FromResult<Stream?>(attempt2),
+            abortAttempt1: () => aborted = true,
+            CancellationToken.None);
+
+        var output = Encoding.UTF8.GetString(dest.ToArray());
+        Assert.True(aborted);
+        Assert.Contains("reasoning_content", output);          // attempt 1 reasoning forwarded
+        Assert.Contains("[WEDGE BANNER]", output);             // banner injected
+        Assert.Contains("the answer", output);                 // attempt 2 content
+        Assert.Contains("[DONE]", output);
+    }
+
+    [Fact]
+    public async Task Wedge_NoLoop_NoReissue()
+    {
+        var source = StreamOf(
+            SseChunk(reasoning: new string('a', 200)) +
+            SseChunk(reasoning: new string('b', 200)) +
+            SseChunk(reasoning: new string('c', 200)) +
+            SseDone());
+        var dest = new MemoryStream();
+        var attempt2Called = false;
+
+        await SseWedgeProcessor.ProcessAsync(source, dest, WedgeOpts(),
+            judge: _ => Task.FromResult<(string?, string?)>((null, null)),
+            makeAttempt2: (_, _, _) => { attempt2Called = true; return Task.FromResult<Stream?>(null); },
+            abortAttempt1: null,
+            CancellationToken.None);
+
+        var output = Encoding.UTF8.GetString(dest.ToArray());
+        Assert.False(attempt2Called);
+        Assert.Contains("[DONE]", output);
+        Assert.DoesNotContain("WEDGE BANNER", output);
+    }
+
+    [Fact]
+    public async Task Wedge_Attempt2Fails_KeepsAttempt1()
+    {
+        var source = StreamOf(
+            SseChunk(reasoning: new string('a', 200)) +
+            SseChunk(reasoning: new string('b', 200)) +
+            SseChunk(reasoning: new string('c', 200)) +
+            SseDone());
+        var dest = new MemoryStream();
+
+        await SseWedgeProcessor.ProcessAsync(source, dest, WedgeOpts(),
+            judge: _ => Task.FromResult(("NUDGE: stop", (string?)null)),
+            makeAttempt2: (_, _, _) => Task.FromResult<Stream?>(null),
+            abortAttempt1: null,
+            CancellationToken.None);
+
+        var output = Encoding.UTF8.GetString(dest.ToArray());
+        Assert.Contains("[DONE]", output); // attempt 1 streamed to completion
+        Assert.DoesNotContain("WEDGE BANNER", output);
+    }
+
+    [Fact]
+    public async Task Wedge_ContentBeforeThreshold_NoJudge()
+    {
+        var source = StreamOf(
+            SseChunk(reasoning: new string('a', 100)) +
+            SseChunk(content: "real answer") +
+            SseDone());
+        var dest = new MemoryStream();
+        var judged = false;
+
+        await SseWedgeProcessor.ProcessAsync(source, dest, WedgeOpts(),
+            judge: _ => { judged = true; return Task.FromResult(("NUDGE: x", (string?)null)); },
+            makeAttempt2: (_, _, _) => Task.FromResult<Stream?>(null),
+            abortAttempt1: null,
+            CancellationToken.None);
+
+        Assert.False(judged);
+        Assert.Contains("real answer", Encoding.UTF8.GetString(dest.ToArray()));
+    }
 }

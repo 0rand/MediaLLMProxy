@@ -19,7 +19,9 @@ public static class LoopGuardService
         Rules:
         - Do NOT solve the task. Do NOT give technical advice. Do NOT answer the underlying question.
         - If the reasoning is healthy and making progress, reply with exactly: NO_LOOP
-        - If the reasoning is looping (repeating the same idea, going in circles, rehashing without progress), reply with a short nudge (1-3 sentences) that steers the model to break out. Start with "NUDGE:".
+        - If the reasoning is looping (repeating the same idea, going in circles, rehashing without progress), reply with:
+          NUDGE: <1-3 sentence nudge that steers the model to break out>
+          SUMMARY: <2-4 sentence distillation of the key insights and progress in the reasoning, so the model can continue from where it left off>
 
         REASONING:
         """;
@@ -74,6 +76,16 @@ public static class LoopGuardService
         return null;
     }
 
+    /// <summary>Parse the SUMMARY block from the advisor response (wedge contract).</summary>
+    public static string? ParseSummary(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var idx = raw.IndexOf("SUMMARY:", StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        var summary = raw[(idx + "SUMMARY:".Length)..].Trim();
+        return string.IsNullOrWhiteSpace(summary) ? null : summary;
+    }
+
     /// <summary>Call the advisor endpoint (OpenAI-compatible). Returns raw content or null on failure.</summary>
     public static async Task<string?> CallAdvisorAsync(HttpClient client, string baseUrl, string model,
         string prompt, int maxTokens, CancellationToken ct)
@@ -99,6 +111,99 @@ public static class LoopGuardService
             return choice.GetProperty("message").TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String
                 ? c.GetString()
                 : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Judge call for the wedge: returns (nudge, summary). Cached by reasoning hash.
+    /// </summary>
+    public static async Task<(string? Nudge, string? Summary)> JudgeWedgeAsync(
+        string reasoning, LoopGuardOptions opts, ObservationCache? cache, HttpClient? advisorClient, CancellationToken ct)
+    {
+        if (advisorClient == null || string.IsNullOrWhiteSpace(opts.AdvisorBackend.BaseUrl))
+            return (null, null);
+
+        var capped = reasoning.Length > opts.MaxReasoningChars ? reasoning[..opts.MaxReasoningChars] : reasoning;
+        var cacheKey = ObservationCache.BuildKey(capped, opts.AdvisorModel, "loopguard-wedge-v1");
+        string? raw = null;
+        if (cache != null && cache.TryGet(cacheKey, out var cached))
+            raw = cached;
+        else
+        {
+            raw = await CallAdvisorAsync(advisorClient, opts.AdvisorBackend.BaseUrl, opts.AdvisorModel,
+                AdvisorPrompt + capped, opts.AdvisorMaxTokens, ct);
+            if (raw != null && cache != null)
+                cache.Set(cacheKey, raw);
+        }
+        if (raw == null) return (null, null);
+        return (ParseVerdict(raw), ParseSummary(raw));
+    }
+
+    /// <summary>
+    /// Build the wedged re-issue body: thinking OFF (chat_template_kwargs.thinking=false,
+    /// reasoning_effort dropped) + wedge message appended to the last user message.
+    /// Wedge message = banner + (summary | verbatim reasoning | nothing) + nudge.
+    /// Returns null on parse failure (caller then keeps attempt 1).
+    /// </summary>
+    public static string? BuildWedgeBody(string body, string? nudge, string? summary, string? reasoning, LoopGuardOptions opts)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                writer.WriteStartObject();
+                var wroteCtk = false;
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (prop.NameEquals("chat_template_kwargs") && opts.WedgeThinkingOff)
+                    {
+                        writer.WritePropertyName("chat_template_kwargs");
+                        writer.WriteStartObject();
+                        if (prop.Value.ValueKind == JsonValueKind.Object)
+                        {
+                            foreach (var kv in prop.Value.EnumerateObject())
+                            {
+                                if (kv.NameEquals("thinking") || kv.NameEquals("reasoning_effort"))
+                                    continue; // force thinking off, drop effort
+                                kv.WriteTo(writer);
+                            }
+                        }
+                        writer.WriteBoolean("thinking", false);
+                        writer.WriteEndObject();
+                        wroteCtk = true;
+                    }
+                    else
+                    {
+                        prop.WriteTo(writer);
+                    }
+                }
+                if (!wroteCtk && opts.WedgeThinkingOff)
+                {
+                    writer.WritePropertyName("chat_template_kwargs");
+                    writer.WriteStartObject();
+                    writer.WriteBoolean("thinking", false);
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndObject();
+            }
+
+            var wedgeText = opts.WedgeBanner;
+            var reasoningMode = (opts.WedgeReasoningMode ?? "").Trim().ToLowerInvariant();
+            if (reasoningMode == "summary" && !string.IsNullOrWhiteSpace(summary))
+                wedgeText += "\n\nKey points from your reasoning: " + summary;
+            else if (reasoningMode == "verbatim" && !string.IsNullOrWhiteSpace(reasoning))
+                wedgeText += "\n\nYour previous reasoning (truncated): " +
+                             (reasoning.Length > opts.MaxReasoningChars ? reasoning[..opts.MaxReasoningChars] : reasoning);
+            if (!string.IsNullOrWhiteSpace(nudge))
+                wedgeText += "\n\n" + nudge;
+
+            return JsonBodyRewriter.TryInjectLoopGuardNudge(Encoding.UTF8.GetString(ms.ToArray()), "", wedgeText);
         }
         catch
         {

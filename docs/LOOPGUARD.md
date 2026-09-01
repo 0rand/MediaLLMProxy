@@ -106,11 +106,19 @@ often overthinking, and the nudge names the root cause.
 - v3: senior-API tier — advisor = teacher-model style (GLM 5.2 via Z.AI) for
   the main lane when the small model's verdict is uncertain (Primo's idea #3).
 
-## v2 (wedge) — mid-stream cut + re-issue (design agreed 2026-09-01)
+## v2 (wedge) — mid-turn steering (design 2026-09-01, validated test case)
 
-The 15-minute case: model loops in thinking with no tool calls (GLM, Qwen 27B).
-The proxy listens to the stream and wedges it out — WITHOUT cutting the client
-connection (the proxy owns the client SSE stream; it just switches upstream).
+The 15-minute / 16k-cut case: model loops in thinking with no content and no
+tool calls (GLM, Qwen 27B, DeepSeek at max thinking). The proxy listens to the
+stream and wedges it out — WITHOUT cutting the client connection (the proxy
+owns the client SSE stream; it just switches upstream).
+
+**Test case (2026-09-01):** Governor Bencher vs DeepSeek Vision-Exp at max
+thinking — half the one-shot questions were cut at 16k tokens with NO output
+(finish_reason=length, content empty). Request-side nudging cannot help (no
+prior turn, no tools); the wedge fires mid-stream at R=8192 reasoning tokens —
+half the budget, before the cut — re-issues with a nudge + thinking budget cut,
+and the question actually produces an answer.
 
 ```
 client ──► proxy ──► upstream (attempt 1: reasoning deltas forwarded live)
@@ -119,7 +127,7 @@ client ──► proxy ──► upstream (attempt 1: reasoning deltas forwarded
                    advisor call (3B, reasoning-so-far) → NUDGE?
                         │ NO_LOOP → keep forwarding attempt 1 (no abort)
                         │ NUDGE  → issue attempt 2 (same body + nudge in last
-                        │          user msg + thinking budget cut) — do NOT
+                        │          user msg + thinking_token_budget cut) — do NOT
                         │          abort attempt 1 yet (fail-open)
                         ▼
                    attempt 2 first chunk arrives → abort attempt 1
@@ -145,8 +153,34 @@ client ──► proxy ──► upstream (attempt 1: reasoning deltas forwarded
 - Trigger config: `LoopGuardWedgeReasoningTokens` (default 8192), content==0
   and no tool_calls required. Judge on both tiers (gate + 3B verdict) — the 3B
   is cheap and prevents cutting a legitimately hard problem mid-thought.
-- Re-issue body mutation: nudge into last user message (same injection as v1)
-  + `thinking_token_budget` cut (default 16384 → 2048, configurable; 0 = leave
-  unchanged). Per-backend knob.
+- Re-issue body mutation (wedge): nudge into last user message + `thinking` OFF
+  (`chat_template_kwargs.thinking: false`, drop `reasoning_effort`) + prior
+  reasoning as context. Prior reasoning inclusion mode:
+  `LoopGuardWedgeReasoningMode` = `summary` (default — the 3B distills the
+  reasoning in the same judge call) | `verbatim` (raw, capped at
+  MaxReasoningChars) | `none`. The wedge message: "Your reasoning was truncated
+  (overthinking). Thinking is now disabled — answer directly. Key points from
+  your reasoning: <summary>. <nudge>".
+- Judge contract (wedge extension): when looping, the advisor outputs
+  `NUDGE: <nudge>` AND `SUMMARY: <2-4 sentence distillation of the reasoning's
+  key insights>` so the model can continue from where it left off. Healthy →
+  `NO_LOOP` as before. One call, both outputs; verdict cache stores the whole
+  response.
 - Metrics: `loop_guard_wedges`, `loop_guard_wedge_ms`; log reasoning tokens at
   cut + nudge text.
+
+### Implementation notes (streaming)
+
+- New `SseWedgeProcessor` (extends the SseObservationInjector pattern): reads
+  SSE lines, parses `delta.reasoning_content` accumulation, counts tokens
+  (chars/4), detects the trigger, calls the advisor, issues attempt 2 (the
+  handler holds the original body + the rewriter), injects the banner, then
+  forwards attempt 2's stream. Heartbeat comments during any pause.
+- The proxy's response to the client is ONE SSE stream it fully controls —
+  switching upstream is invisible to the client.
+- Re-issue uses the same `forwarded` body (post media/loopguard rewrites) so
+  the wedge composes with rehome + request-side loop guard.
+- Bencher verification: point the bench at the proxy (`--base-url
+  http://127.0.0.1:8000 --model main`) with max thinking; the overthinking
+  questions that previously cut at 16k should now produce output, with
+  `loop_guard_wedges` incrementing and the banner visible in the transcript.

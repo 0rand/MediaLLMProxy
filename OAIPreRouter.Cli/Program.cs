@@ -685,9 +685,38 @@ public class Program
 
                 try
                 {
-                    if (observationBlock != null)
+                    var isStreaming = JsonFieldReader.TryReadTopLevelBool(body, "stream") ?? false;
+                    if (loopGuard.Enabled && loopGuard.WedgeEnabled && isStreaming)
                     {
-                        var isStreaming = JsonFieldReader.TryReadTopLevelBool(body, "stream") ?? false;
+                        // Mid-turn wedge: watch reasoning growth; on judge NUDGE, re-issue
+                        // with thinking OFF + prior-reasoning context, stream to the SAME
+                        // client connection. Fail-open inside the processor.
+                        var wedgeSw = Stopwatch.StartNew();
+                        await SseWedgeProcessor.ProcessAsync(
+                            responseStream, ctx.Response.Body, loopGuard,
+                            judge: reasoning => LoopGuardService.JudgeWedgeAsync(reasoning, loopGuard, obsCache,
+                                httpClientFactory.CreateClient("loopguard"), ctx.RequestAborted),
+                            makeAttempt2: async (reasoning, nudge, summary) =>
+                            {
+                                var wedgedBody = LoopGuardService.BuildWedgeBody(forwarded, nudge, summary, reasoning, loopGuard);
+                                if (wedgedBody == null) return null;
+                                using var outbound2 = new HttpRequestMessage(HttpMethod.Post, targetUri);
+                                outbound2.Content = new StringContent(wedgedBody, Encoding.UTF8, "application/json");
+                                CopyHeaders(ctx, outbound2, backend);
+                                var client2 = httpClientFactory.CreateClient("proxy");
+                                var resp2 = await client2.SendAsync(outbound2, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
+                                if (!resp2.IsSuccessStatusCode) { resp2.Dispose(); return null; }
+                                return await resp2.Content.ReadAsStreamAsync(ctx.RequestAborted);
+                            },
+                            abortAttempt1: () => upstream.Dispose(),
+                            ctx.RequestAborted);
+                        wedgeSw.Stop();
+                        metrics.LoopGuardWedge();
+                        metrics.LoopGuardWedgeMs(wedgeSw.ElapsedMilliseconds);
+                        log.LogInformation("[{RequestId}] LOOPGUARD wedge processed ({ElapsedMs}ms)", requestId, wedgeSw.ElapsedMilliseconds);
+                    }
+                    else if (observationBlock != null)
+                    {
                         if (isStreaming)
                         {
                             await SseObservationInjector.InjectAsync(responseStream, ctx.Response.Body, observationBlock, ctx.RequestAborted);

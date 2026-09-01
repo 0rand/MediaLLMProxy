@@ -306,6 +306,11 @@ Everything is environment variables (`.NET` config binding) or
 | `LoopGuardOptions__AdvisorTimeoutSeconds` | Advisor call timeout. Default 10 |
 | `LoopGuardOptions__MaxReasoningChars` | Cap on reasoning chars sent to the advisor. Default 20000 |
 | `LoopGuardOptions__AdvisorFallbackToStatic` | true (default): advisor dead → inject StaticNudge (stage 1 fallback); false → fail open |
+| `LoopGuardOptions__WedgeEnabled` | false (default). **true = mid-turn wedge armed**: streaming reasoning past the wedge threshold with no content/tool calls → judge → re-issue with thinking OFF + prior-reasoning context, streamed to the same client connection |
+| `LoopGuardOptions__WedgeReasoningTokens` | Wedge trigger: reasoning token estimate (chars/4) in the live stream. Default 8192 |
+| `LoopGuardOptions__WedgeThinkingOff` | true (default): re-issue with `chat_template_kwargs.thinking=false` (reasoning_effort dropped) |
+| `LoopGuardOptions__WedgeReasoningMode` | Prior-reasoning inclusion: `summary` (default — 3B distills in the judge call) \| `verbatim` (raw, capped) \| `none` |
+| `LoopGuardOptions__WedgeBanner` | Banner prepended to the re-issued stream (visible to the user AND persisted) |
 | `LoopGuardOptions__InjectionMarker` | Marker prepended to the injected nudge (marks it as a system-side note, not a user instruction) |
 | `MultimodalOptions__VisionBackend__ApiKey` | primary vision API token (omit for unauthenticated local inference) |
 | `MultimodalOptions__VisionModel` | primary vision model id |
@@ -515,6 +520,32 @@ Behavior:
 - Observability: `X-PreRouter-LoopGuard: nudge|no_loop` response header,
   `loop_guard_checks/nudges/errors/advisor_ms` in /health metrics, startup log
   line, `LOOPGUARD nudge injected` / `LOOPGUARD no_loop` request logs.
+
+### Loop guard wedge (stage 3 — mid-turn steering)
+
+The one-shot case: a single question with no tools, no prior turn — the model
+thinks past the budget and gets cut with no output (e.g. max-thinking bench
+runs cut at 16k tokens of pure reasoning). Request-side nudging cannot help;
+the wedge watches the live stream and steers mid-generation.
+
+```bash
+export LoopGuardOptions__WedgeEnabled=true
+export LoopGuardOptions__WedgeReasoningTokens=8192
+```
+
+Behavior:
+- Trigger: streaming reasoning > threshold with zero content and zero tool
+  calls → judge (3B) decides. NO_LOOP → keep streaming; NUDGE → wedge.
+- Wedge: issue attempt 2 (same body + thinking OFF + prior-reasoning context)
+  BEFORE aborting attempt 1 (fail-open). When attempt 2's first chunk arrives,
+  attempt 1 is aborted, a banner is injected, and attempt 2 streams to the SAME
+  client connection — the client never sees a second request.
+- Judge contract: `NUDGE: <nudge>` + `SUMMARY: <distillation>` — the summary
+  carries the reasoning's key insights into the re-issue so the model
+  continues from where it left off.
+- Client sees: attempt 1 reasoning → pause (heartbeats) → banner → attempt 2
+  answer. One continuous SSE stream.
+- Metrics: `loop_guard_wedges`, `loop_guard_wedge_ms` in /health.
 
 ### API keys for cloud models
 
