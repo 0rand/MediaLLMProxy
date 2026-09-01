@@ -191,8 +191,8 @@ Proxy config (env):
 export RoutingOptions__PrimaryBackend__BaseUrl=http://your-vllm:8100
 export RoutingOptions__PrimaryBackend__RewriteModel=deepseek-v4-flash
 export RoutingOptions__PrimaryBackend__ModelAlias=main        # must match Hermes model id
-export RoutingOptions__PrimaryBackend__Temperature=0.8        # Hermes forces 1.0 — pin it
-export RoutingOptions__PrimaryBackend__TopP=0.25
+export RoutingOptions__PrimaryBackend__Temperature=0.5        # goldilocks zone (verified tool-eval 90/100, 0% errors)
+export RoutingOptions__PrimaryBackend__TopP=1.0               # Hermes forces 1.0/1.0 — pin it back
 export MultimodalOptions__Enabled=true
 export MultimodalOptions__DetourVision=false                  # native vision on the primary
 export MultimodalOptions__RehomeToolMedia=true                # tool-message media → user message
