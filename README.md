@@ -299,7 +299,13 @@ Everything is environment variables (`.NET` config binding) or
 | `MultimodalOptions__RehomePersistPrompt` | Instruction part included in the rehomed user message (default: asks the model to write a complete description into its own answer). Clients do not persist tool-result image bytes, so the model's description is the durable record for later turns; empty string disables the instruction |
 | `LoopGuardOptions__Enabled` | false (default). **true = loop guard active**: when the last assistant message's reasoning exceeds the threshold, a nudge is injected into the last user message before forwarding |
 | `LoopGuardOptions__ReasoningTokenThreshold` | Gate: reasoning size estimate (chars/4 ≈ tokens) of the previous assistant message. Default 8192 |
-| `LoopGuardOptions__StaticNudge` | Static nudge text (stage 1 — no advisor model). Default: "You have been thinking for a long time. Please take a step back and provide an output for the smallest first step before continuing." Empty = no-op |
+| `LoopGuardOptions__StaticNudge` | Static nudge text (fallback / no-advisor mode). Default: "You have been thinking for a long time. Please take a step back and provide an output for the smallest first step before continuing." Empty = no fallback |
+| `LoopGuardOptions__AdvisorBackend__BaseUrl` | Stage 2 judge endpoint (small fast LLM, e.g. Qwen 3B on llama.cpp). Empty = static-only mode |
+| `LoopGuardOptions__AdvisorModel` | Advisor model id. Default qwen25-3b |
+| `LoopGuardOptions__AdvisorMaxTokens` | Advisor response cap. Default 200 |
+| `LoopGuardOptions__AdvisorTimeoutSeconds` | Advisor call timeout. Default 10 |
+| `LoopGuardOptions__MaxReasoningChars` | Cap on reasoning chars sent to the advisor. Default 20000 |
+| `LoopGuardOptions__AdvisorFallbackToStatic` | true (default): advisor dead → inject StaticNudge (stage 1 fallback); false → fail open |
 | `LoopGuardOptions__InjectionMarker` | Marker prepended to the injected nudge (marks it as a system-side note, not a user instruction) |
 | `MultimodalOptions__VisionBackend__ApiKey` | primary vision API token (omit for unauthenticated local inference) |
 | `MultimodalOptions__VisionModel` | primary vision model id |
@@ -478,29 +484,37 @@ export MultimodalOptions__DetourVision=false   # native vision on the primary
 export MultimodalOptions__RehomeToolMedia=true # DeepSeek-style backend
 ```
 
-### Loop guard (stage 1 — static nudge on long reasoning)
+### Loop guard (stage 2 — LLM judge with static fallback)
 
 Models sometimes loop: long deliberation, no progress, no tool calls. The
 proxy watches the request and, when the previous assistant message's reasoning
-exceeds a threshold, injects a nudge into the last user message before
-forwarding — steering the model to take a step back and produce the smallest
-first step. No advisor model needed (stage 1); the nudge is static and
-configurable.
+exceeds a threshold, asks a small fast **judge** model whether the reasoning is
+actually looping. If the judge says so, its nudge is injected into the last
+user message before forwarding; if the judge is healthy (NO_LOOP), the request
+passes through untouched. If the judge endpoint is dead, the proxy falls back
+to the static nudge (stage 1).
 
 ```bash
 export LoopGuardOptions__Enabled=true
 export LoopGuardOptions__ReasoningTokenThreshold=8192
+export LoopGuardOptions__AdvisorBackend__BaseUrl=http://judge-host:8008   # e.g. Qwen 3B on llama.cpp
+export LoopGuardOptions__AdvisorModel=qwen25-3b
 ```
 
 Behavior:
 - Gate: last assistant `reasoning_content` size estimate (chars/4) ≥ threshold.
-- Nudge is appended to the LAST user message (string or array content; a new
-  user message is inserted if none exists) with `InjectionMarker` prepended.
-- Fail-open: parse anomalies → request passes through unchanged.
+- Judge prompt: strict loop-detection contract (NO_LOOP / NUDGE: <text>); the
+  judge never solves the task, only judges. Verdicts cached by reasoning hash.
+- NUDGE → advisor's nudge appended to the LAST user message (string or array
+  content; a new user message is inserted if none exists) with
+  `InjectionMarker` prepended.
+- NO_LOOP → forward unchanged (`X-PreRouter-LoopGuard: no_loop`).
+- Advisor dead/timeout → static nudge fallback when `AdvisorFallbackToStatic`
+  (default true) and `StaticNudge` non-empty; else fail open.
 - Ephemeral: the nudge rides only this request; the client never persists it.
-- Observability: `X-PreRouter-LoopGuard: nudge` response header,
-  `loop_guard_checks` / `loop_guard_nudges` in /health metrics, startup log
-  line, `LOOPGUARD nudge injected` request log.
+- Observability: `X-PreRouter-LoopGuard: nudge|no_loop` response header,
+  `loop_guard_checks/nudges/errors/advisor_ms` in /health metrics, startup log
+  line, `LOOPGUARD nudge injected` / `LOOPGUARD no_loop` request logs.
 
 ### API keys for cloud models
 

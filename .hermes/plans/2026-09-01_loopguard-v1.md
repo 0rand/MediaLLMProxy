@@ -1,8 +1,8 @@
 # LoopGuard v1 Implementation Plan
 
-> **Status:** STAGE 1 (static nudge) IMPLEMENTED + VERIFIED 2026-09-01 — 165/165 tests,
-> live e2e via mock backend (nudge confirmed in forwarded body, header + metrics).
-> Advisor stage (Tasks 5-7) still pending.
+> **Status:** STAGE 2 (LLM judge + static fallback) IMPLEMENTED + VERIFIED 2026-09-01 —
+> 178/178 tests; live e2e: real Qwen 3B judge nudge in forwarded body (3.0s), dead-judge
+> static fallback confirmed. Stage 3 (wedge) + subagent/senior tiers pending.
 
 > **For Hermes:** Implement task-by-task with TDD; commit after each task.
 

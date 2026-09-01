@@ -46,6 +46,10 @@ public class Program
         builder.Services.AddHttpClient<SttDetourClient>(c => c.Timeout = TimeSpan.FromSeconds(150))
             .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { UseProxy = false });
 
+        builder.Services.AddHttpClient("loopguard",
+                c => c.Timeout = TimeSpan.FromSeconds(builder.Configuration.GetValue<int>("LoopGuardOptions:AdvisorTimeoutSeconds", 10)))
+            .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { UseProxy = false });
+
         var app = builder.Build();
 
         var options = app.Services.GetRequiredService<IOptions<RoutingOptions>>().Value;
@@ -99,8 +103,10 @@ public class Program
             multimodal.Enabled ? $" (vision via {multimodal.VisionBackend.BaseUrl}, model {multimodal.VisionModel}; audio via {multimodal.AudioBackend.BaseUrl})" : "");
         log.LogInformation("Detour gates: vision={DetourVision} audio={DetourAudio} videoSupport={VideoSupport} rehomeToolMedia={RehomeToolMedia} (false = passthrough to primary; primary must be natively multimodal)",
             multimodal.DetourVision, multimodal.DetourAudio, multimodal.VideoSupport, multimodal.RehomeToolMedia);
-        log.LogInformation("LoopGuard: enabled={Enabled} threshold={Threshold} staticNudge={HasNudge}",
-            loopGuard.Enabled, loopGuard.ReasoningTokenThreshold, !string.IsNullOrWhiteSpace(loopGuard.StaticNudge));
+        log.LogInformation("LoopGuard: enabled={Enabled} threshold={Threshold} advisor={Advisor} staticNudge={HasNudge}",
+            loopGuard.Enabled, loopGuard.ReasoningTokenThreshold,
+            string.IsNullOrWhiteSpace(loopGuard.AdvisorBackend.BaseUrl) ? "none" : loopGuard.AdvisorBackend.BaseUrl,
+            !string.IsNullOrWhiteSpace(loopGuard.StaticNudge));
 
         app.MapPost("v1/chat/completions", HandleChatCompletion);
         app.MapPost("chat/completions", HandleChatCompletion);
@@ -119,7 +125,7 @@ public class Program
                 bridge = multimodal.Enabled
                     ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)metrics.Snapshot() }
                     : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)null },
-                loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, metrics = (object?)metrics.Snapshot() }
+                loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)loopGuard.AdvisorBackend.BaseUrl, model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() }
             });
         });
 
@@ -598,7 +604,7 @@ public class Program
                 log.LogInformation("[{RequestId}] BRIDGE response block chars={Chars}", requestId, observationBlock.Length);
             }
 
-            // === LoopGuard (stage 1: static nudge on long reasoning) ===
+            // === LoopGuard (stage 2: gate + LLM judge; static fallback) ===
             // Runs on the FINAL body (after media rewrite). Fail-open: any anomaly → forward
             // unchanged. Verdict rides the response header for observability.
             string? loopGuardBody = null;
@@ -606,20 +612,30 @@ public class Program
             if (loopGuard.Enabled)
             {
                 var target = forwardBody ?? body;
-                var result = LoopGuardService.Evaluate(target, loopGuard);
+                var advisorClient = httpClientFactory.CreateClient("loopguard");
+                var result = await LoopGuardService.EvaluateAsync(target, loopGuard, obsCache, advisorClient, ctx.RequestAborted);
+                if (result.AdvisorMs > 0)
+                    metrics.LoopGuardAdvisorMs(result.AdvisorMs);
                 if (result.Body != null)
                 {
                     loopGuardBody = result.Body;
                     loopGuardVerdict = result.Verdict;
                     metrics.LoopGuardCheck();
                     metrics.LoopGuardNudge();
-                    log.LogInformation("[{RequestId}] LOOPGUARD nudge injected (reasoning threshold {Threshold})",
-                        requestId, loopGuard.ReasoningTokenThreshold);
+                    log.LogInformation("[{RequestId}] LOOPGUARD nudge injected (reasoning threshold {Threshold}, advisorMs={AdvisorMs})",
+                        requestId, loopGuard.ReasoningTokenThreshold, result.AdvisorMs);
+                }
+                else if (result.Verdict == "no_loop")
+                {
+                    metrics.LoopGuardCheck();
+                    log.LogInformation("[{RequestId}] LOOPGUARD no_loop (advisorMs={AdvisorMs})", requestId, result.AdvisorMs);
                 }
                 else if (LoopGuardService.ExtractLastReasoning(target) != null)
                 {
                     metrics.LoopGuardCheck();
                 }
+                if (result.AdvisorMs > 0 && result.Verdict == null)
+                    metrics.LoopGuardError();
             }
 
             // === Pass-through: body is forwarded as-is ===
