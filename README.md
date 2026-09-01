@@ -171,6 +171,73 @@ Hermes gotchas:
 - Auto-titles after image chats may 400: Hermes serializes the base64 into the
   title prompt and hits the context limit. Cosmetic.
 
+#### DeepSeek + Hermes: native vision quickstart (the tool-message case)
+
+DeepSeek's chat template only accepts images in **user** messages — an
+`image_url` part inside a `role:"tool"` message is rejected with HTTP 400
+("Images are supported in user messages only"). Hermes's native-vision fast
+path produces exactly that shape: when the model calls `vision_analyze` on a
+natively multimodal main model, the image rides in the tool result.
+
+The proxy fixes this by **re-homing**: media inside tool messages is moved
+byte-for-byte into a fresh `role:"user"` message right after the tool result,
+so DeepSeek sees the pixels in a legal role. No description bridge — the main
+model sees the image natively.
+
+Proxy config (env):
+
+```bash
+# proxy → DeepSeek vLLM (or any DeepSeek-style backend)
+export RoutingOptions__PrimaryBackend__BaseUrl=http://your-vllm:8100
+export RoutingOptions__PrimaryBackend__RewriteModel=deepseek-v4-flash
+export RoutingOptions__PrimaryBackend__ModelAlias=main        # must match Hermes model id
+export RoutingOptions__PrimaryBackend__Temperature=0.8        # Hermes forces 1.0 — pin it
+export RoutingOptions__PrimaryBackend__TopP=0.25
+export MultimodalOptions__Enabled=true
+export MultimodalOptions__DetourVision=false                  # native vision on the primary
+export MultimodalOptions__RehomeToolMedia=true                # tool-message media → user message
+```
+
+Hermes config (`~/.hermes/config.yaml`):
+
+```yaml
+custom_providers:
+  - name: MEDIAPROXY
+    api_key: ''                      # local proxy — no key needed
+    api_mode: openai
+    base_url: http://your-proxy:8000/v1
+    model: main                      # must match the proxy's ModelAlias
+    models:
+      main:
+        context_length: 1000000
+        supports_vision: true        # Hermes attaches images natively
+        extra_body:
+          temperature: 0.2
+          thinking_token_budget: 16384
+```
+
+Use it (CLI — two flags, not the slug form):
+
+```bash
+hermes chat --provider MEDIAPROXY -m main -q "Describe the image at /path/to/img.png"
+```
+
+What happens then:
+
+1. The model calls `vision_analyze` → Hermes embeds the image in the tool result.
+2. The proxy moves the image into a user message (byte-for-byte) and prepends
+   `RehomeMarker` + `RehomePersistPrompt`.
+3. DeepSeek sees the pixels natively and answers.
+4. `RehomePersistPrompt` asks the model to include a complete description in
+   its answer — because clients like Hermes do **not** persist tool-result
+   image bytes (their session DB strips them to `[screenshot]`), the model's
+   own description is what survives across turns. Ask "look again" and the
+   pixels come back on demand.
+
+Verify: `curl http://your-proxy:8000/health` shows `rehomeToolMedia: true`;
+responses carry `X-PreRouter-Media: image`; `/health` metrics show
+`rehome_ok` incrementing.
+
 ### opencode
 
 Add a provider with a single model (verified working config):
