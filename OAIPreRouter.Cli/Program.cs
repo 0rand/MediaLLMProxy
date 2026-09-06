@@ -101,8 +101,8 @@ public class Program
 
         log.LogInformation("Multimodal bridge: enabled={Enabled}{VisionDetails}", multimodal.Enabled,
             multimodal.Enabled ? $" (vision via {multimodal.VisionBackend.BaseUrl}, model {multimodal.VisionModel}; audio via {multimodal.AudioBackend.BaseUrl})" : "");
-        log.LogInformation("Detour gates: vision={DetourVision} audio={DetourAudio} videoSupport={VideoSupport} rehomeToolMedia={RehomeToolMedia} (false = passthrough to primary; primary must be natively multimodal)",
-            multimodal.DetourVision, multimodal.DetourAudio, multimodal.VideoSupport, multimodal.RehomeToolMedia);
+        log.LogInformation("Detour gates: vision={DetourVision} audio={DetourAudio} videoSupport={VideoSupport} rehomeToolMedia={RehomeToolMedia} rehomeAtEnd={RehomeAtEnd} (false = passthrough to primary; primary must be natively multimodal)",
+            multimodal.DetourVision, multimodal.DetourAudio, multimodal.VideoSupport, multimodal.RehomeToolMedia, multimodal.RehomeAtEnd);
         log.LogInformation("LoopGuard: enabled={Enabled} threshold={Threshold} advisor={Advisor} staticNudge={HasNudge}",
             loopGuard.Enabled, loopGuard.ReasoningTokenThreshold,
             string.IsNullOrWhiteSpace(loopGuard.AdvisorBackend.BaseUrl) ? "none" : loopGuard.AdvisorBackend.BaseUrl,
@@ -123,8 +123,8 @@ public class Program
                 systemPromptThresholdBytes = options.SystemPromptThresholdBytes,
                 fastLaneThresholdBytes = options.FastLaneThresholdBytes,
                 bridge = multimodal.Enabled
-                    ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)metrics.Snapshot() }
-                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, metrics = (object?)null },
+                    ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)metrics.Snapshot() }
+                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)null },
                 loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)loopGuard.AdvisorBackend.BaseUrl, model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() }
             });
         });
