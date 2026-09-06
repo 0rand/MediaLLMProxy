@@ -459,6 +459,75 @@ public class JsonBodyRewriterMediaTests
     }
 
     [Fact]
+    public void RehomeAtEnd_ToolImageWithTrailingUser_AppendedAsFinalMessage()
+    {
+        // mlx-serve-style backend: vision tokens are spliced into the FINAL user turn only.
+        // Tool message is NOT last — a live user question trails it. The rehomed image must
+        // land at the END of the array (after the trailing user message), not after the tool message.
+        var body = "{\"messages\":[" +
+            "{\"role\":\"user\",\"content\":\"look at this\"}," +
+            "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"vision_analyze\",\"arguments\":\"{}\"}}]}," +
+            "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"Image loaded — answer.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,THEPIXELS\"}}]}," +
+            "{\"role\":\"user\",\"content\":\"What was in the image?\"}]}";
+        var opts = DefaultOpts() with { RehomeToolMedia = true, RehomeAtEnd = true };
+
+        var result = JsonBodyRewriter.TryRewriteMedia(body, new List<MediaContentScanner.MediaPart>(),
+            new Dictionary<int, string>(), opts, ToolImageMedia());
+
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var messages = doc.RootElement.GetProperty("messages");
+
+        // policy + user + assistant + tool + trailing-user + rehomed-user
+        Assert.Equal(6, messages.GetArrayLength());
+
+        // rehomed message is LAST, image in it; trailing user question untouched at index 4
+        Assert.Equal("What was in the image?", messages[4].GetProperty("content").GetString());
+        var rehomed = messages[5];
+        Assert.Equal("user", rehomed.GetProperty("role").GetString());
+        var rehomedContent = rehomed.GetProperty("content");
+        Assert.Equal(3, rehomedContent.GetArrayLength()); // marker + persist + image
+        Assert.Contains("REHOMED", rehomedContent[0].GetProperty("text").GetString());
+        Assert.Equal("data:image/png;base64,THEPIXELS",
+            rehomedContent[2].GetProperty("image_url").GetProperty("url").GetString());
+
+        // tool message: image stripped, text kept
+        var toolContent = messages[3].GetProperty("content");
+        Assert.Equal(1, toolContent.GetArrayLength());
+        Assert.Equal("Image loaded — answer.", toolContent[0].GetProperty("text").GetString());
+
+        // pixels appear exactly once in the whole body
+        Assert.Equal(1, CountOccurrences(result!, "THEPIXELS"));
+    }
+
+    [Fact]
+    public void RehomeAtEnd_False_KeepsInsertAfterToolMessage()
+    {
+        // Default placement regression guard: with a trailing user message present and
+        // RehomeAtEnd=false (DeepSeek proven path), the rehomed message still lands
+        // immediately after the tool message, BEFORE the trailing user question.
+        var body = "{\"messages\":[" +
+            "{\"role\":\"user\",\"content\":\"look at this\"}," +
+            "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"vision_analyze\",\"arguments\":\"{}\"}}]}," +
+            "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"Image loaded — answer.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,THEPIXELS\"}}]}," +
+            "{\"role\":\"user\",\"content\":\"What was in the image?\"}]}";
+        var opts = DefaultOpts() with { RehomeToolMedia = true };
+
+        var result = JsonBodyRewriter.TryRewriteMedia(body, new List<MediaContentScanner.MediaPart>(),
+            new Dictionary<int, string>(), opts, ToolImageMedia());
+
+        Assert.NotNull(result);
+        using var doc = JsonDocument.Parse(result!);
+        var messages = doc.RootElement.GetProperty("messages");
+        Assert.Equal(6, messages.GetArrayLength());
+        // rehomed at index 4 (right after tool), trailing user pushed to 5
+        Assert.Equal("user", messages[4].GetProperty("role").GetString());
+        Assert.Equal("data:image/png;base64,THEPIXELS",
+            messages[4].GetProperty("content")[2].GetProperty("image_url").GetProperty("url").GetString());
+        Assert.Equal("What was in the image?", messages[5].GetProperty("content").GetString());
+    }
+
+    [Fact]
     public void Rehome_TwoImagesInOneToolMessage_BothMovedInOrder()
     {
         var body = "{\"messages\":[" +

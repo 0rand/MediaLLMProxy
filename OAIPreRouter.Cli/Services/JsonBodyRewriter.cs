@@ -190,6 +190,10 @@ public static class JsonBodyRewriter
                     stripSet.Add((part.MessageIndex, part.PartIndex));
                 }
 
+                // RehomeAtEnd: rehomed user messages are buffered here (raw JSON) and appended
+                // after the last original message instead of after their tool message.
+                List<string>? deferredRehome = opts.RehomeAtEnd ? new List<string>() : null;
+
                 // Build the re-home map: media parts inside role:"tool" messages that survive the
                 // rewrite (not in stripSet) are moved into a fresh role:"user" message inserted
                 // immediately after the tool message. This is the DeepSeek-shaped backend fix —
@@ -286,41 +290,39 @@ public static class JsonBodyRewriter
 
                             // Re-home: emit a fresh role:"user" message carrying the tool message's
                             // media parts byte-for-byte, so backends that only accept media in user
-                            // messages (DeepSeek vLLM) still receive the pixels natively. The message
-                            // lands immediately after the tool message — protocol-valid: assistant
-                            // tool_calls → tool result → user turn.
+                            // messages (DeepSeek vLLM) still receive the pixels natively. Default
+                            // placement: immediately after the tool message — protocol-valid: assistant
+                            // tool_calls → tool result → user turn. With RehomeAtEnd the message is
+                            // deferred to the end of the array instead (mlx-serve splices vision
+                            // tokens into the FINAL user turn only; mid-conversation images are
+                            // silently dropped — see MultimodalOptions.RehomeAtEnd).
                             if (rehomeByMessageIndex.TryGetValue(i, out var rehomeParts))
                             {
                                 rehomeParts.Sort();
-                                writer.WriteStartObject();
-                                writer.WriteString("role", "user");
-                                writer.WritePropertyName("content");
-                                writer.WriteStartArray();
-                                writer.WriteStartObject();
-                                writer.WriteString("type", "text");
-                                writer.WriteString("text", opts.RehomeMarker);
-                                writer.WriteEndObject();
-                                // Durable-record instruction: the model writes its own description
-                                // into the answer so the record survives in client history — the
-                                // pixels themselves are only visible on this turn.
-                                if (!string.IsNullOrWhiteSpace(opts.RehomePersistPrompt))
+                                if (deferredRehome != null)
                                 {
-                                    writer.WriteStartObject();
-                                    writer.WriteString("type", "text");
-                                    writer.WriteString("text", opts.RehomePersistPrompt);
-                                    writer.WriteEndObject();
-                                }
-                                if (msg.TryGetProperty("content", out var srcContent) &&
-                                    srcContent.ValueKind == JsonValueKind.Array)
-                                {
-                                    foreach (var pi in rehomeParts)
+                                    using var sideMs = new MemoryStream();
+                                    using (var sideWriter = new Utf8JsonWriter(sideMs))
                                     {
-                                        if (pi >= 0 && pi < srcContent.GetArrayLength())
-                                            srcContent[pi].WriteTo(writer);
+                                        WriteRehomeUserMessage(sideWriter, msg, rehomeParts, opts);
                                     }
+                                    deferredRehome.Add(Encoding.UTF8.GetString(sideMs.ToArray()));
                                 }
-                                writer.WriteEndArray();
-                                writer.WriteEndObject();
+                                else
+                                {
+                                    WriteRehomeUserMessage(writer, msg, rehomeParts, opts);
+                                }
+                            }
+                        }
+
+                        // RehomeAtEnd: append the deferred rehomed user messages after every
+                        // original message, so the image lands in the final user turn.
+                        if (deferredRehome != null)
+                        {
+                            foreach (var raw in deferredRehome)
+                            {
+                                using var parsed = JsonDocument.Parse(raw);
+                                parsed.RootElement.WriteTo(writer);
                             }
                         }
 
@@ -340,6 +342,45 @@ public static class JsonBodyRewriter
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Writes the rehomed role:"user" message: marker text part, optional durable-record
+    /// instruction, then the media parts byte-for-byte from the source tool message.
+    /// Shared by both placements (after-tool-message and end-of-array).
+    /// </summary>
+    private static void WriteRehomeUserMessage(Utf8JsonWriter writer, JsonElement msg,
+        List<int> rehomeParts, MultimodalOptions opts)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("role", "user");
+        writer.WritePropertyName("content");
+        writer.WriteStartArray();
+        writer.WriteStartObject();
+        writer.WriteString("type", "text");
+        writer.WriteString("text", opts.RehomeMarker);
+        writer.WriteEndObject();
+        // Durable-record instruction: the model writes its own description
+        // into the answer so the record survives in client history — the
+        // pixels themselves are only visible on this turn.
+        if (!string.IsNullOrWhiteSpace(opts.RehomePersistPrompt))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("type", "text");
+            writer.WriteString("text", opts.RehomePersistPrompt);
+            writer.WriteEndObject();
+        }
+        if (msg.TryGetProperty("content", out var srcContent) &&
+            srcContent.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var pi in rehomeParts)
+            {
+                if (pi >= 0 && pi < srcContent.GetArrayLength())
+                    srcContent[pi].WriteTo(writer);
+            }
+        }
+        writer.WriteEndArray();
+        writer.WriteEndObject();
     }
 
     /// <summary>

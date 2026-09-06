@@ -58,6 +58,15 @@ public record MultimodalOptions
     public string RehomePersistPrompt { get; init; } =
         "After you have viewed the attached media, include in your answer a concise but complete description of it (subject, composition, colors, text, objects, notable details) written so that you could answer follow-up questions about it from the description alone — the pixels will not be available again in later turns.";
 
+    /// <summary>When true, the rehomed role:"user" message is appended at the END of the messages
+    /// array instead of immediately after the tool message. Required for backends whose chat
+    /// template splices vision tokens ONLY into the final user turn (mlx-serve / Qwen MLX: a
+    /// mid-conversation user image is silently dropped — the encoder runs, the embeddings are
+    /// discarded, prompt_tokens shows the text-only count, and the model confabulates around the
+    /// missing pixels without any error). Default false = insert after the tool message, the
+    /// proven placement for DeepSeek vLLM, which splices user-turn images anywhere in history.</summary>
+    public bool RehomeAtEnd { get; init; } = false;
+
     public BackendConfig VisionBackend { get; init; } = new() { BaseUrl = "http://localhost:8000" };
     public string VisionModel { get; init; } = "Qwen3.6-35B-A3B-MLX-VL-oQ8";
 
