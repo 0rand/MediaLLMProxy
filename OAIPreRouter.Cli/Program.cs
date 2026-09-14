@@ -274,6 +274,10 @@ public class Program
             string? forwardBody = null;
             var mediaKinds = new List<string>();
             var observations = new Dictionary<int, string>();
+            // Set inside the media block; used by the response-block emitter (which lives outside
+            // the media block) to know whether the CURRENT turn produced a fresh observation.
+            var currentTurnObserved = false;
+            var lastMsgIndex = -1;
             if (multimodal.Enabled)
             {
                 var media = MediaContentScanner.Scan(body);
@@ -295,6 +299,7 @@ public class Program
                     // only when behind an OPEN gate — media behind a CLOSED gate passes through
                     // raw as payload and must never be rewritten away.
                     var currentMedia = MediaContentScanner.LastTurnMedia(body, media);
+                    lastMsgIndex = MediaContentScanner.GetMessageCount(body) - 1;
                     var historyMediaCount = media.Count - currentMedia.Count;
                     if (historyMediaCount > 0)
                         log.LogInformation("[{RequestId}] BRIDGE history media skipped={Count} (only last turn is detoured)", requestId, historyMediaCount);
@@ -524,6 +529,41 @@ public class Program
                         }
                     }
 
+                    // === Idempotent observation replay (Path A) ===
+                    // The observation for media must appear in the SAME message on EVERY turn, not
+                    // just the turn that first sent the media. Otherwise the same logical user
+                    // message is serialized differently across turns and the forwarded body is NOT a
+                    // strict prefix of the next turn — which breaks the text model's prefix cache
+                    // (full reprocess every turn). Historical media is NEVER re-detoured (no vision
+                    // reload): we replay the cached observation, keyed byte-identically (same media
+                    // bytes + model + per-message text), so the rewrite is deterministic.
+                    if (lastMsgIndex < 0) lastMsgIndex = MediaContentScanner.GetMessageCount(body) - 1;
+                    var currentIdx = new HashSet<int>(currentMedia.Select(m => m.MessageIndex));
+                    foreach (var histPart in behindOpenGate)
+                    {
+                        if (currentIdx.Contains(histPart.MessageIndex)) continue;      // current turn handled above
+                        if (observations.ContainsKey(histPart.MessageIndex)) continue; // already replayed
+                        if (histPart.Kind != MediaContentScanner.MediaKind.Image) continue;
+                        if (histPart.Url == null || !histPart.Url.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        // Group all behind-open-gate images in this one message to mirror turn-1 keying.
+                        var group = behindOpenGate.Where(p => p.MessageIndex == histPart.MessageIndex
+                                && p.Kind == MediaContentScanner.MediaKind.Image
+                                && p.Url != null && p.Url.StartsWith("data:", StringComparison.OrdinalIgnoreCase)).ToList();
+                        var concatenated = string.Join("|||", group.Select(p => p.Url!));
+                        var key = ObservationCache.BuildKey(concatenated, multimodal.VisionModel,
+                                        UserTextExtractor.Extract(body, group));
+                        if (obsCache.TryGet(key, out var cachedObs))
+                        {
+                            observations[histPart.MessageIndex] =
+                                (observations.ContainsKey(histPart.MessageIndex) ? observations[histPart.MessageIndex] + "\n" : "")
+                                + $"[Image] {cachedObs}";
+                        }
+                    }
+
+                    // A fresh observation only exists when the CURRENT turn carried real media.
+                    currentTurnObserved = currentMedia.Count > 0 && observations.ContainsKey(lastMsgIndex);
+
                     // Build X-PreRouter-Media header: comma-joined kinds in first-appearance order
                     var seenKinds = new HashSet<string>();
                     foreach (var m in media)
@@ -590,17 +630,18 @@ public class Program
             }
 
             // === Observation block for the response ===
-            // The request-side injection is ephemeral (clients store raw history), so the
-            // observation is ALSO appended to the response as a gated block — it lands inside
-            // the assistant message the client persists, making it durable for later turns
-            // without ever re-detouring historical media.
+            // The observation is durable in the request-side user message (replayed from cache
+            // on every turn — Path A), so by default it is NOT echoed into the assistant content:
+            // embedding it there made the model re-read it as fresh media every turn. The echo is
+            // capped behind EmitObservationBlock (only for clients that drop the media bytes) and
+            // only ever emits the CURRENT turn's observation — never re-emits replayed history.
             string? observationBlock = null;
-            if (observations.Count > 0)
+            if (multimodal.EmitObservationBlock && currentTurnObserved && observations.TryGetValue(lastMsgIndex, out var curObs))
             {
                 // Escape triple-asterisk sequences in observation text so an adversarial image
                 // cannot make the vision model emit the end delimiter and break the gated region.
-                var escaped = string.Join("\n", observations.Values.Select(v => v.Replace("***", "** *")));
-                observationBlock = $"{multimodal.ObservationBlockStart}\n{escaped}\n{multimodal.ObservationBlockEnd}";
+                var escaped = curObs.Replace("***", "** *");
+                observationBlock = $"{multimodal.ObservationBlockStart}\n\n{escaped}\n\n{multimodal.ObservationBlockEnd}";
                 log.LogInformation("[{RequestId}] BRIDGE response block chars={Chars}", requestId, observationBlock.Length);
             }
 
