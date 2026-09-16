@@ -55,6 +55,10 @@ public class VisionDetourClient(HttpClient http, IOptions<MultimodalOptions> opt
         // description is a per-backend choice). Null = backend default.
         if (backend?.Temperature is double temp) payload["temperature"] = temp;
         if (backend?.TopP is double topP) payload["top_p"] = topP;
+        // Force non-thinking mode: the vision model (Qwen3.6-VL) otherwise returns
+        // its deliberation in reasoning_content and leaves content empty — the
+        // observation we want is the clean answer, not the scratchpad.
+        payload["chat_template_kwargs"] = new Dictionary<string, object?> { ["enable_thinking"] = false };
         return JsonSerializer.Serialize(payload);
     }
 
