@@ -45,7 +45,12 @@ public class SttDetourClient(HttpClient http, IOptions<MultimodalOptions> opts, 
                 format = format
             });
 
-            using var req = new HttpRequestMessage(HttpMethod.Post, "http://127.0.0.1:8085/transcribe")
+            // Destination is CONFIGURATION, not a constant: MultimodalOptions.AudioBackend.BaseUrl
+            // (default http://127.0.0.1:8085). Hardcoding loopback here silently ignored the
+            // configured STT endpoint, so a proxy pointed at a remote/renamed STT service still
+            // dialled 127.0.0.1 — failing 502 on hosts that have no local STT (Cave) while looking
+            // correctly configured in /health. Mirrors VisionDetourClient's backend.BaseUrl use.
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"{o.AudioBackend.BaseUrl.TrimEnd('/')}/transcribe")
             {
                 Content = new StringContent(payload, Encoding.UTF8, "application/json")
             };

@@ -35,11 +35,88 @@ public class SttDetourClientTests
 
     private SttDetourClient CreateClient(Func<HttpRequestMessage, HttpResponseMessage> respond)
     {
+        return CreateClient(new MultimodalOptions(), respond);
+    }
+
+    private SttDetourClient CreateClient(MultimodalOptions options, Func<HttpRequestMessage, HttpResponseMessage> respond)
+    {
         var handler = new FakeHandler(respond);
         var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(5) };
-        var opts = Options.Create(new MultimodalOptions());
+        var opts = Options.Create(options);
         var logger = new TestLogger<SttDetourClient>();
         return new SttDetourClient(http, opts, logger);
+    }
+
+    private const string WavDataUrl = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+
+    [Fact]
+    public async Task TranscribeAsync_UsesConfiguredAudioBackendBaseUrl()
+    {
+        // Regression: the STT destination was hardcoded to http://127.0.0.1:8085/transcribe,
+        // so MultimodalOptions.AudioBackend.BaseUrl was silently ignored — a proxy pointed at a
+        // remote/renamed STT service still dialled loopback (and failed with 502 on any host
+        // that has no local STT). The configured base URL is authoritative.
+        string? seen = null;
+        var client = CreateClient(new MultimodalOptions
+        {
+            AudioBackend = new BackendConfig { BaseUrl = "http://stt.test:9999" }
+        }, request =>
+        {
+            seen = request.RequestUri?.ToString();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(@"{""text"":""configured backend""}")
+            };
+        });
+
+        var result = await client.TranscribeAsync(WavDataUrl, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("configured backend", result.Text);
+        Assert.Equal("http://stt.test:9999/transcribe", seen);
+    }
+
+    [Fact]
+    public async Task TranscribeAsync_TrailingSlashInBaseUrl_JoinsWithoutDoubleSlash()
+    {
+        string? seen = null;
+        var client = CreateClient(new MultimodalOptions
+        {
+            AudioBackend = new BackendConfig { BaseUrl = "http://stt.test:9999/" }
+        }, request =>
+        {
+            seen = request.RequestUri?.ToString();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(@"{""text"":""ok""}")
+            };
+        });
+
+        var result = await client.TranscribeAsync(WavDataUrl, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("http://stt.test:9999/transcribe", seen);
+    }
+
+    [Fact]
+    public async Task TranscribeAsync_DefaultOptions_StillTargetsLoopbackStt()
+    {
+        // The C# default (no config override) must stay http://127.0.0.1:8085 — local installs
+        // that never set AudioBackend must not change behaviour.
+        string? seen = null;
+        var client = CreateClient(new MultimodalOptions(), request =>
+        {
+            seen = request.RequestUri?.ToString();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(@"{""text"":""local""}")
+            };
+        });
+
+        var result = await client.TranscribeAsync(WavDataUrl, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("http://127.0.0.1:8085/transcribe", seen);
     }
 
     [Fact]
