@@ -123,10 +123,16 @@ public class JsonBodyRewriterMediaTests
     [Fact]
     public void Media_PolicySystemMessagePresentExactlyOnce_AfterLeadingSystem()
     {
-        // (c) policy system message present exactly once, before first user, after leading system message
-        var input = "{\"messages\":[{\"role\":\"system\",\"content\":\"You are a helpful assistant.\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}]}";
-        var parts = new List<MediaContentScanner.MediaPart>();
-        var observations = new Dictionary<int, string>();
+        // (c) policy system message present exactly once, before first user, after leading system
+        // message — and ONLY when the rewrite carries observations. The policy governs detoured
+        // media observations; injecting it on a no-observation rewrite (native rehome) inserts a
+        // message before the first user and breaks the text model's prefix cache.
+        var input = "{\"messages\":[{\"role\":\"system\",\"content\":\"You are a helpful assistant.\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/img.png\"}}]}]}";
+        var parts = new List<MediaContentScanner.MediaPart>
+        {
+            new(MediaContentScanner.MediaKind.Image, 1, 1, "https://example.com/img.png")
+        };
+        var observations = new Dictionary<int, string> { [1] = "A red square" };
         var opts = DefaultOpts();
 
         var result = JsonBodyRewriter.TryRewriteMedia(input, parts, observations, opts);
@@ -327,10 +333,11 @@ public class JsonBodyRewriterMediaTests
         using var doc = JsonDocument.Parse(result!);
         var messages = doc.RootElement.GetProperty("messages");
 
-        // policy system + user
-        Assert.Equal(2, messages.GetArrayLength());
+        // user only: no policy injection when the rewrite carries no observations
+        // (see JsonBodyRewriterIdempotencyTests.Native_Rehome_Without_Observations_...)
+        Assert.Equal(1, messages.GetArrayLength());
 
-        var userMsg = messages[1];
+        var userMsg = messages[0];
         var content = userMsg.GetProperty("content");
         Assert.Equal(JsonValueKind.Array, content.ValueKind);
 
@@ -391,21 +398,21 @@ public class JsonBodyRewriterMediaTests
         using var doc = JsonDocument.Parse(result!);
         var messages = doc.RootElement.GetProperty("messages");
 
-        // policy + user + assistant + tool + rehomed-user
-        Assert.Equal(5, messages.GetArrayLength());
+        // user + assistant + tool + rehomed-user (no policy: no observations on this path)
+        Assert.Equal(4, messages.GetArrayLength());
 
         // assistant tool_calls preserved
-        Assert.True(messages[2].TryGetProperty("tool_calls", out _));
+        Assert.True(messages[1].TryGetProperty("tool_calls", out _));
 
         // tool message: text kept, image stripped
-        var tool = messages[3];
+        var tool = messages[2];
         Assert.Equal("tool", tool.GetProperty("role").GetString());
         var toolContent = tool.GetProperty("content");
         Assert.Equal(1, toolContent.GetArrayLength());
         Assert.Equal("Image loaded — answer.", toolContent[0].GetProperty("text").GetString());
 
         // rehomed user message: marker + persist prompt + the image byte-for-byte
-        var rehomed = messages[4];
+        var rehomed = messages[3];
         Assert.Equal("user", rehomed.GetProperty("role").GetString());
         var rehomedContent = rehomed.GetProperty("content");
         Assert.Equal(3, rehomedContent.GetArrayLength());
@@ -430,13 +437,13 @@ public class JsonBodyRewriterMediaTests
         Assert.NotNull(result);
         using var doc = JsonDocument.Parse(result!);
         var messages = doc.RootElement.GetProperty("messages");
-        Assert.Equal(5, messages.GetArrayLength());
+        Assert.Equal(4, messages.GetArrayLength());
 
-        var toolContent = messages[3].GetProperty("content");
+        var toolContent = messages[2].GetProperty("content");
         Assert.Equal(1, toolContent.GetArrayLength());
         Assert.Contains("rehomed to user message", toolContent[0].GetProperty("text").GetString());
 
-        var rehomedContent = messages[4].GetProperty("content");
+        var rehomedContent = messages[3].GetProperty("content");
         Assert.Equal(3, rehomedContent.GetArrayLength());
         Assert.Equal("data:image/png;base64,THEPIXELS",
             rehomedContent[2].GetProperty("image_url").GetProperty("url").GetString());
@@ -452,7 +459,7 @@ public class JsonBodyRewriterMediaTests
         Assert.NotNull(result);
         using var doc = JsonDocument.Parse(result!);
         var messages = doc.RootElement.GetProperty("messages");
-        var rehomedContent = messages[4].GetProperty("content");
+        var rehomedContent = messages[3].GetProperty("content");
         Assert.Equal(2, rehomedContent.GetArrayLength()); // marker + image only
         Assert.Equal("data:image/png;base64,THEPIXELS",
             rehomedContent[1].GetProperty("image_url").GetProperty("url").GetString());
@@ -478,12 +485,12 @@ public class JsonBodyRewriterMediaTests
         using var doc = JsonDocument.Parse(result!);
         var messages = doc.RootElement.GetProperty("messages");
 
-        // policy + user + assistant + tool + trailing-user + rehomed-user
-        Assert.Equal(6, messages.GetArrayLength());
+        // user + assistant + tool + trailing-user + rehomed-user
+        Assert.Equal(5, messages.GetArrayLength());
 
-        // rehomed message is LAST, image in it; trailing user question untouched at index 4
-        Assert.Equal("What was in the image?", messages[4].GetProperty("content").GetString());
-        var rehomed = messages[5];
+        // rehomed message is LAST, image in it; trailing user question untouched at index 3
+        Assert.Equal("What was in the image?", messages[3].GetProperty("content").GetString());
+        var rehomed = messages[4];
         Assert.Equal("user", rehomed.GetProperty("role").GetString());
         var rehomedContent = rehomed.GetProperty("content");
         Assert.Equal(3, rehomedContent.GetArrayLength()); // marker + persist + image
@@ -492,7 +499,7 @@ public class JsonBodyRewriterMediaTests
             rehomedContent[2].GetProperty("image_url").GetProperty("url").GetString());
 
         // tool message: image stripped, text kept
-        var toolContent = messages[3].GetProperty("content");
+        var toolContent = messages[2].GetProperty("content");
         Assert.Equal(1, toolContent.GetArrayLength());
         Assert.Equal("Image loaded — answer.", toolContent[0].GetProperty("text").GetString());
 
@@ -519,12 +526,12 @@ public class JsonBodyRewriterMediaTests
         Assert.NotNull(result);
         using var doc = JsonDocument.Parse(result!);
         var messages = doc.RootElement.GetProperty("messages");
-        Assert.Equal(6, messages.GetArrayLength());
-        // rehomed at index 4 (right after tool), trailing user pushed to 5
-        Assert.Equal("user", messages[4].GetProperty("role").GetString());
+        Assert.Equal(5, messages.GetArrayLength());
+        // rehomed at index 3 (right after tool), trailing user pushed to 4
+        Assert.Equal("user", messages[3].GetProperty("role").GetString());
         Assert.Equal("data:image/png;base64,THEPIXELS",
-            messages[4].GetProperty("content")[2].GetProperty("image_url").GetProperty("url").GetString());
-        Assert.Equal("What was in the image?", messages[5].GetProperty("content").GetString());
+            messages[3].GetProperty("content")[2].GetProperty("image_url").GetProperty("url").GetString());
+        Assert.Equal("What was in the image?", messages[4].GetProperty("content").GetString());
     }
 
     [Fact]
@@ -548,9 +555,9 @@ public class JsonBodyRewriterMediaTests
         Assert.NotNull(result);
         using var doc = JsonDocument.Parse(result!);
         var messages = doc.RootElement.GetProperty("messages");
-        Assert.Equal(4, messages.GetArrayLength()); // policy + user + tool + rehomed-user
+        Assert.Equal(3, messages.GetArrayLength()); // user + tool + rehomed-user
 
-        var rehomedContent = messages[3].GetProperty("content");
+        var rehomedContent = messages[2].GetProperty("content");
         Assert.Equal(4, rehomedContent.GetArrayLength()); // marker + persist prompt + 2 images
         Assert.Equal("data:image/png;base64,AAA",
             rehomedContent[2].GetProperty("image_url").GetProperty("url").GetString());
@@ -569,9 +576,9 @@ public class JsonBodyRewriterMediaTests
         using var doc = JsonDocument.Parse(result!);
         var messages = doc.RootElement.GetProperty("messages");
 
-        // policy + user + assistant + tool — no injected user message
-        Assert.Equal(4, messages.GetArrayLength());
-        Assert.Equal(2, messages[3].GetProperty("content").GetArrayLength()); // text + image both stay
+        // user + assistant + tool — no injected user message, no policy (no observations)
+        Assert.Equal(3, messages.GetArrayLength());
+        Assert.Equal(2, messages[2].GetProperty("content").GetArrayLength()); // text + image both stay
         Assert.Contains("THEPIXELS", result!);
         Assert.DoesNotContain("REHOMED", result);
     }

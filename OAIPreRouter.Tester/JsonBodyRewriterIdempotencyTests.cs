@@ -85,4 +85,74 @@ public class JsonBodyRewriterIdempotencyTests
             .ToList();
         Assert.Contains(textParts, t => t != null && t.StartsWith("[UNTRUSTED OBSERVATION]: [Image] A solid red square."));
     }
+
+    // ─── Native rehome must not disturb already-cached history ────────────────────────────
+    // The policy system prompt governs DETOURED media observations. Native media
+    // (DetourVision=false) produces NO observation, so injecting the policy on a native
+    // rehome is both meaningless and destructive: it inserts a NEW message before the first
+    // user message, shifting every previously cached token → full reprocess on the first
+    // media turn. Regression for the 2026-09-17 Cave prefix-cache incident.
+
+    private const string ToolImageBodyJson = "{\"messages\":[" +
+        "{\"role\":\"user\",\"content\":\"look at this\"}," +
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"inspect_frame\",\"arguments\":\"{}\"}}]}," +
+        "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"Image loaded.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,THEPIXELS\"}}]}]}";
+
+    private static List<MediaContentScanner.MediaPart> ToolImagePart() =>
+        new() { new(MediaContentScanner.MediaKind.Image, 2, 1, "data:image/png;base64,THEPIXELS") };
+
+    [Fact]
+    public void Native_Rehome_Without_Observations_Must_Not_Touch_Prior_History()
+    {
+        var opts = DefaultOpts() with { RehomeToolMedia = true };
+        var result = JsonBodyRewriter.TryRewriteMedia(ToolImageBodyJson,
+            new List<MediaContentScanner.MediaPart>(), new Dictionary<int, string>(), opts, ToolImagePart());
+
+        Assert.NotNull(result);
+        using var outDoc = JsonDocument.Parse(result!);
+        using var inDoc = JsonDocument.Parse(ToolImageBodyJson);
+        var outMsgs = outDoc.RootElement.GetProperty("messages");
+        var inMsgs = inDoc.RootElement.GetProperty("messages");
+
+        // No policy injection: the native path carries no observations to govern.
+        var systems = 0;
+        foreach (var m in outMsgs.EnumerateArray())
+            if (m.GetProperty("role").GetString() == "system") systems++;
+        Assert.Equal(0, systems);
+
+        // Messages before the tool result keep their exact index and content.
+        for (var i = 0; i < 2; i++)
+            Assert.Equal(inMsgs[i].GetRawText(), outMsgs[i].GetRawText());
+
+        // Rehome adds exactly one user message; nothing else is added or reordered.
+        Assert.Equal(inMsgs.GetArrayLength() + 1, outMsgs.GetArrayLength());
+        Assert.Equal("user", outMsgs[3].GetProperty("role").GetString());
+    }
+
+    [Fact]
+    public void First_Tool_Image_After_User_Image_Keeps_Earlier_Messages_Intact()
+    {
+        // The reported incident shape: a user-image turn is already in history, then the
+        // model's first tool result carries an image. Only the tail may change.
+        var body = "{\"messages\":[" +
+            "{\"role\":\"system\",\"content\":\"sys\"}," + UserImgJson("What do you see?") + "," +
+            "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"inspect_frame\",\"arguments\":\"{}\"}}]}," +
+            "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"Image loaded.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,THEPIXELS\"}}]}]}";
+        var opts = DefaultOpts() with { RehomeToolMedia = true };
+        var part = new MediaContentScanner.MediaPart(MediaContentScanner.MediaKind.Image, 3, 1,
+            "data:image/png;base64,THEPIXELS");
+
+        var result = JsonBodyRewriter.TryRewriteMedia(body, new List<MediaContentScanner.MediaPart>(),
+            new Dictionary<int, string>(), opts, new List<MediaContentScanner.MediaPart> { part });
+
+        Assert.NotNull(result);
+        using var outDoc = JsonDocument.Parse(result!);
+        using var inDoc = JsonDocument.Parse(body);
+        var outMsgs = outDoc.RootElement.GetProperty("messages");
+        var inMsgs = inDoc.RootElement.GetProperty("messages");
+
+        for (var i = 0; i < 3; i++)   // system, user(+image), assistant tool_calls
+            Assert.Equal(inMsgs[i].GetRawText(), outMsgs[i].GetRawText());
+        Assert.Equal(inMsgs.GetArrayLength() + 1, outMsgs.GetArrayLength());
+    }
 }

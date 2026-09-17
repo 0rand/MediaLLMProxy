@@ -161,6 +161,14 @@ public static class JsonBodyRewriter
                 JsonElement? messagesElem = null;
                 int messagesLength = 0;
 
+                // The policy explains how to treat DETOURED media observations, so it is only
+                // injected when this rewrite actually carries observations. Native media
+                // (DetourVision=false, tool-media rehome) produces none — inserting the policy
+                // there would add a message BEFORE the first user turn and shift every token
+                // already in the text model's prefix cache (full reprocess on the first media
+                // turn). See JsonBodyRewriterIdempotencyTests.
+                var hasObservations = observationsByMessageIndex.Count > 0;
+
                 foreach (var prop in doc.RootElement.EnumerateObject())
                 {
                     if (prop.NameEquals("messages"))
@@ -246,7 +254,7 @@ public static class JsonBodyRewriter
                         for (var i = 0; i < messagesLength; i++)
                         {
                             // Insert policy system message before the first user message
-                            if (i == firstUserIdx && firstUserIdx >= 0)
+                            if (hasObservations && i == firstUserIdx && firstUserIdx >= 0)
                             {
                                 writer.WriteStartObject();
                                 writer.WriteString("role", "system");
