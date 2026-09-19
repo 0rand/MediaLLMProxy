@@ -99,7 +99,7 @@ public class LoopGuardTests
     public async Task CallAdvisor_ReturnsContent()
     {
         var handler = new FakeHandler(_ => JsonResponse("{\"choices\":[{\"message\":{\"content\":\"NUDGE: stop\"}}]}"));
-        var text = await LoopGuardService.CallAdvisorAsync(ClientWith(handler), "http://x", "m", "prompt", 200, CancellationToken.None);
+        var text = await LoopGuardService.CallAdvisorAsync(ClientWith(handler), "http://x", "m", "prompt", 200, null, CancellationToken.None);
         Assert.Equal("NUDGE: stop", text);
         Assert.Equal(1, handler.Calls);
     }
@@ -108,8 +108,33 @@ public class LoopGuardTests
     public async Task CallAdvisor_HttpError_ReturnsNull()
     {
         var handler = new FakeHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.BadGateway));
-        var text = await LoopGuardService.CallAdvisorAsync(ClientWith(handler), "http://x", "m", "prompt", 200, CancellationToken.None);
+        var text = await LoopGuardService.CallAdvisorAsync(ClientWith(handler), "http://x", "m", "prompt", 200, null, CancellationToken.None);
         Assert.Null(text);
+    }
+
+    [Fact]
+    public async Task CallAdvisor_AttachesBearerWhenApiKeySet()
+    {
+        // Remote advisors (e.g. DeepSeek API) reject unauthenticated calls with 401 — the
+        // Authorization header must be attached when AdvisorBackend.ApiKey is configured,
+        // and omitted when it is not (local advisors).
+        string? seen = null;
+        var handler = new FakeHandler(req =>
+        {
+            seen = req.Headers.Authorization?.ToString();
+            return JsonResponse("{\"choices\":[{\"message\":{\"content\":\"NO_LOOP\"}}]}");
+        });
+
+        await LoopGuardService.CallAdvisorAsync(ClientWith(handler), "http://x", "m", "prompt", 200, "sk-test-123", CancellationToken.None);
+        Assert.Equal("Bearer sk-test-123", seen);
+
+        seen = null;
+        await LoopGuardService.CallAdvisorAsync(ClientWith(handler), "http://x", "m", "prompt", 200, null, CancellationToken.None);
+        Assert.Null(seen);
+
+        seen = null;
+        await LoopGuardService.CallAdvisorAsync(ClientWith(handler), "http://x", "m", "prompt", 200, "Bearer raw-format", CancellationToken.None);
+        Assert.Equal("Bearer raw-format", seen);
     }
 
     // ─── EvaluateAsync: static-only mode ──────────────────────────────────────────────────

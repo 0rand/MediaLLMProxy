@@ -86,9 +86,12 @@ public static class LoopGuardService
         return string.IsNullOrWhiteSpace(summary) ? null : summary;
     }
 
-    /// <summary>Call the advisor endpoint (OpenAI-compatible). Returns raw content or null on failure.</summary>
+    /// <summary>Call the advisor endpoint (OpenAI-compatible). Returns raw content or null on failure.
+    /// When apiKey is non-empty, an Authorization: Bearer *** header is attached — remote advisors
+    /// (e.g. DeepSeek API) reject unauthenticated calls; local advisors never see it (local
+    /// bindings strip Authorization anyway).</summary>
     public static async Task<string?> CallAdvisorAsync(HttpClient client, string baseUrl, string model,
-        string prompt, int maxTokens, CancellationToken ct)
+        string prompt, int maxTokens, string? apiKey, CancellationToken ct)
     {
         try
         {
@@ -104,6 +107,9 @@ public static class LoopGuardService
             {
                 Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
             };
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
+                    "Bearer", apiKey.StartsWith("Bearer ") ? apiKey["Bearer ".Length..] : apiKey);
             using var resp = await client.SendAsync(req, ct);
             if (!resp.IsSuccessStatusCode) return null;
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
@@ -135,7 +141,7 @@ public static class LoopGuardService
         else
         {
             raw = await CallAdvisorAsync(advisorClient, opts.AdvisorBackend.BaseUrl, opts.AdvisorModel,
-                AdvisorPrompt + capped, opts.AdvisorMaxTokens, ct);
+                AdvisorPrompt + capped, opts.AdvisorMaxTokens, opts.AdvisorBackend.ApiKey, ct);
             if (raw != null && cache != null)
                 cache.Set(cacheKey, raw);
         }
@@ -252,7 +258,7 @@ public static class LoopGuardService
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 raw = await CallAdvisorAsync(advisorClient, opts.AdvisorBackend.BaseUrl, opts.AdvisorModel,
-                    AdvisorPrompt + capped, opts.AdvisorMaxTokens, ct);
+                    AdvisorPrompt + capped, opts.AdvisorMaxTokens, opts.AdvisorBackend.ApiKey, ct);
                 sw.Stop();
                 advisorMs = sw.ElapsedMilliseconds;
                 if (raw != null && cache != null)
