@@ -1,6 +1,5 @@
-# Install only after build/test plus an isolated wire-capture verification.
-# System-unit template; service runs as xraan. Adjust paths only if the
-# production layout changes.
+# Copy to /etc/systemd/system/media-llm-proxy-mimo.service, replace YOUR_USER,
+# then run: sudo systemctl daemon-reload && sudo systemctl enable --now media-llm-proxy-mimo.service
 [Unit]
 Description=MediaLLMProxy MiMo structured-output lane (:8020 -> :8100)
 After=network-online.target
@@ -8,12 +7,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=xraan
-WorkingDirectory=/home/xraan/mediallmproxy-mimo
-Environment=DOTNET_ROOT=/home/xraan/.dotnet
-Environment=PATH=/home/xraan/.dotnet:/usr/bin:/bin
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/.config/mediallmproxy-mimo
+Environment=DOTNET_ROOT=/home/YOUR_USER/.dotnet
+Environment=PATH=/home/YOUR_USER/.dotnet:/usr/local/bin:/usr/bin:/bin
 Environment=ASPNETCORE_ENVIRONMENT=proxy-mimo
-ExecStart=/home/xraan/.dotnet/dotnet /home/xraan/mediallmproxy-mimo/bin/OAIPreRouter.Cli.dll
+ExecStart=/home/YOUR_USER/.dotnet/dotnet /home/YOUR_USER/.local/share/mediallmproxy-mimo/bin/OAIPreRouter.Cli.dll
 Restart=always
 RestartSec=2
 

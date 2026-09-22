@@ -19,7 +19,7 @@ public record LoopGuardOptions
 
     /// <summary>Advisor endpoint (stage 2 judge). Empty BaseUrl = advisor disabled →
     /// static-only mode.</summary>
-    public BackendConfig AdvisorBackend { get; init; } = new() { BaseUrl = "http://192.168.1.88:8008" };
+    public BackendConfig AdvisorBackend { get; init; } = new() { BaseUrl = "http://localhost:8008" };
     public string AdvisorModel { get; init; } = "qwen25-3b";
     public int AdvisorMaxTokens { get; init; } = 200;
     public int AdvisorTimeoutSeconds { get; init; } = 10;

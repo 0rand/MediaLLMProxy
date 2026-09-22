@@ -16,6 +16,10 @@ model receives a terse observation instead of media it cannot see.
   injected as untrusted observation data (marked, never instructions).
 - **Streaming-safe** — SSE passes through untouched; the bridge only rewrites
   the request body.
+- **MiMo structured-output compatibility** — an opt-in, dedicated-instance
+  policy keeps reasoning enabled for ordinary work but uses MiMo's no-think
+  template path for server-enforced JSON/schema responses. See
+  [docs/MIMO_STRUCTURED_OUTPUT.md](docs/MIMO_STRUCTURED_OUTPUT.md).
 - **One binary** — .NET 10, zero NuGet dependencies beyond ASP.NET Core.
 
 ```

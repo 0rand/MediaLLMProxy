@@ -36,7 +36,7 @@ request ──► gate: last assistant reasoning_content > X tokens?
 ```bash
 LoopGuardOptions__Enabled=false
 LoopGuardOptions__ReasoningTokenThreshold=8192   # gate: last reasoning tokens
-LoopGuardOptions__AdvisorBackend__BaseUrl=http://192.168.1.88:8008
+LoopGuardOptions__AdvisorBackend__BaseUrl=http://localhost:8008  # or your advisor host
 LoopGuardOptions__AdvisorModel=qwen25-3b
 LoopGuardOptions__AdvisorBackend__Temperature=0
 LoopGuardOptions__AdvisorMaxTokens=200
