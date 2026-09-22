@@ -29,6 +29,7 @@ public class Program
         builder.Services.Configure<RoutingOptions>(builder.Configuration.GetSection(RoutingOptions.ConfigSection));
         builder.Services.Configure<MultimodalOptions>(builder.Configuration.GetSection(MultimodalOptions.ConfigSection));
         builder.Services.Configure<LoopGuardOptions>(builder.Configuration.GetSection(LoopGuardOptions.ConfigSection));
+        builder.Services.Configure<StructuredOutputOptions>(builder.Configuration.GetSection(StructuredOutputOptions.ConfigSection));
         builder.Services.AddSingleton<ConnectionLimiter>();
         builder.Services.AddSingleton<ObservationCache>();
         builder.Services.AddSingleton<BridgeMetrics>();
@@ -60,6 +61,7 @@ public class Program
         var log = app.Logger;
         var multimodal = app.Services.GetRequiredService<IOptions<MultimodalOptions>>().Value;
         var loopGuard = app.Services.GetRequiredService<IOptions<LoopGuardOptions>>().Value;
+        var structuredOutput = app.Services.GetRequiredService<IOptions<StructuredOutputOptions>>().Value;
         var visionDetour = app.Services.GetRequiredService<VisionDetourClient>();
         var sttDetour = app.Services.GetRequiredService<SttDetourClient>();
         var obsCache = app.Services.GetRequiredService<ObservationCache>();
@@ -107,6 +109,8 @@ public class Program
             loopGuard.Enabled, loopGuard.ReasoningTokenThreshold,
             string.IsNullOrWhiteSpace(loopGuard.AdvisorBackend.BaseUrl) ? "none" : loopGuard.AdvisorBackend.BaseUrl,
             !string.IsNullOrWhiteSpace(loopGuard.StaticNudge));
+        log.LogInformation("Structured output: disableThinkingForResponseFormat={Enabled}",
+            structuredOutput.DisableThinkingForResponseFormat);
 
         app.MapPost("v1/chat/completions", HandleChatCompletion);
         app.MapPost("chat/completions", HandleChatCompletion);
@@ -125,7 +129,8 @@ public class Program
                 bridge = multimodal.Enabled
                     ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)metrics.Snapshot() }
                     : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)null },
-                loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)loopGuard.AdvisorBackend.BaseUrl, model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() }
+                loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)loopGuard.AdvisorBackend.BaseUrl, model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() },
+                structuredOutput = new { disableThinkingForResponseFormat = structuredOutput.DisableThinkingForResponseFormat }
             });
         });
 
@@ -679,8 +684,27 @@ public class Program
                     metrics.LoopGuardError();
             }
 
-            // === Pass-through: body is forwarded as-is ===
+            // Structured-output compatibility is intentionally the LAST body rewrite: a
+            // preceding media/LoopGuard rewrite must not restore caller enable_thinking=true.
+            // Scope is this dedicated MiMo proxy; all non-response_format traffic is byte-for-byte
+            // unchanged by this rule.
+            var structuredThinkingDisabled = false;
             var forwarded = loopGuardBody ?? forwardBody ?? body;
+            if (structuredOutput.DisableThinkingForResponseFormat &&
+                JsonFieldReader.TryReadTopLevelString(forwarded, "response_format") is not null)
+            {
+                var rewritten = JsonBodyRewriter.TryDisableThinkingForResponseFormat(forwarded);
+                if (rewritten is not null)
+                {
+                    forwarded = rewritten;
+                    structuredThinkingDisabled = true;
+                    log.LogInformation("[{RequestId}] STRUCTURED_OUTPUT force enable_thinking=false", requestId);
+                }
+                else
+                {
+                    log.LogWarning("[{RequestId}] STRUCTURED_OUTPUT rewrite failed; forwarding unchanged", requestId);
+                }
+            }
             using var outbound = new HttpRequestMessage(HttpMethod.Post, targetUri);
             outbound.Content = new StringContent(forwarded, Encoding.UTF8, "application/json");
 
@@ -707,6 +731,8 @@ public class Program
                     ctx.Response.Headers["X-PreRouter-Media"] = string.Join(",", mediaKinds);
                 if (loopGuardVerdict != null)
                     ctx.Response.Headers["X-PreRouter-LoopGuard"] = loopGuardVerdict;
+                if (structuredThinkingDisabled)
+                    ctx.Response.Headers["X-PreRouter-Structured-Output"] = "thinking-off";
 
                 foreach (var h in upstream.Headers)
                     ctx.Response.Headers[h.Key] = h.Value.ToArray();

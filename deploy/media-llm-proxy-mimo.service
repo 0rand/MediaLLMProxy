@@ -1,0 +1,21 @@
+# Install only after build/test plus an isolated wire-capture verification.
+# System-unit template; service runs as xraan. Adjust paths only if the
+# production layout changes.
+[Unit]
+Description=MediaLLMProxy MiMo structured-output lane (:8020 -> :8100)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xraan
+WorkingDirectory=/home/xraan/mediallmproxy-mimo
+Environment=DOTNET_ROOT=/home/xraan/.dotnet
+Environment=PATH=/home/xraan/.dotnet:/usr/bin:/bin
+Environment=ASPNETCORE_ENVIRONMENT=proxy-mimo
+ExecStart=/home/xraan/.dotnet/dotnet /home/xraan/mediallmproxy-mimo/bin/OAIPreRouter.Cli.dll
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -134,6 +134,65 @@ public static class JsonBodyRewriter
     }
 
     /// <summary>
+    /// If the request asks the backend for a structured response, force MiMo's
+    /// template into no-think mode. This preserves every other template kwarg
+    /// and is a no-op when response_format is absent. MiMo/vLLM otherwise can
+    /// place schema-valid JSON in reasoning_content (with content empty) on a
+    /// post-tool response_format turn.
+    /// </summary>
+    public static string? TryDisableThinkingForResponseFormat(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("response_format", out _))
+                return json;
+
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                writer.WriteStartObject();
+                var wroteTemplateKwargs = false;
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (!prop.NameEquals("chat_template_kwargs"))
+                    {
+                        prop.WriteTo(writer);
+                        continue;
+                    }
+
+                    wroteTemplateKwargs = true;
+                    writer.WritePropertyName("chat_template_kwargs");
+                    writer.WriteStartObject();
+                    if (prop.Value.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var kwarg in prop.Value.EnumerateObject())
+                        {
+                            if (!kwarg.NameEquals("enable_thinking"))
+                                kwarg.WriteTo(writer);
+                        }
+                    }
+                    writer.WriteBoolean("enable_thinking", false);
+                    writer.WriteEndObject();
+                }
+                if (!wroteTemplateKwargs)
+                {
+                    writer.WritePropertyName("chat_template_kwargs");
+                    writer.WriteStartObject();
+                    writer.WriteBoolean("enable_thinking", false);
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndObject();
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Rewrites media parts out and observations in, in ONE validated pass.
     /// When <paramref name="allMedia"/> is provided AND opts.RehomeToolMedia is true, media parts
     /// found inside role:"tool" messages that are NOT part of <paramref name="parts"/> (i.e. not
