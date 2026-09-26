@@ -134,11 +134,18 @@ public static class JsonBodyRewriter
     }
 
     /// <summary>
-    /// If the request asks the backend for a structured response, force MiMo's
+    /// If the request asks the backend for a structured response, force the
     /// template into no-think mode. This preserves every other template kwarg
     /// and is a no-op when response_format is absent. MiMo/vLLM otherwise can
     /// place schema-valid JSON in reasoning_content (with content empty) on a
     /// post-tool response_format turn.
+    /// Writes BOTH template spellings — vLLM/Qwen3-parser style
+    /// (enable_thinking=false) and the newer HF transformers style
+    /// (thinking=false) — so whichever key the deployed chat template actually
+    /// reads gets the no-think boundary seeded. Unused keys are inert in Jinja.
+    /// Measured fact: Qwen3.8-Flash-Next's template gates ONLY on
+    /// enable_thinking (chat_template.jinja: "enable_thinking is defined and
+    /// enable_thinking is false"); the bare "thinking" kwarg is ignored there.
     /// </summary>
     public static string? TryDisableThinkingForResponseFormat(string json)
     {
@@ -168,11 +175,13 @@ public static class JsonBodyRewriter
                     {
                         foreach (var kwarg in prop.Value.EnumerateObject())
                         {
-                            if (!kwarg.NameEquals("enable_thinking"))
+                            if (!kwarg.NameEquals("enable_thinking") &&
+                                !kwarg.NameEquals("thinking"))
                                 kwarg.WriteTo(writer);
                         }
                     }
                     writer.WriteBoolean("enable_thinking", false);
+                    writer.WriteBoolean("thinking", false);
                     writer.WriteEndObject();
                 }
                 if (!wroteTemplateKwargs)
@@ -180,6 +189,7 @@ public static class JsonBodyRewriter
                     writer.WritePropertyName("chat_template_kwargs");
                     writer.WriteStartObject();
                     writer.WriteBoolean("enable_thinking", false);
+                    writer.WriteBoolean("thinking", false);
                     writer.WriteEndObject();
                 }
                 writer.WriteEndObject();
