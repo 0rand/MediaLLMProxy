@@ -111,6 +111,8 @@ public class Program
             !string.IsNullOrWhiteSpace(loopGuard.StaticNudge));
         log.LogInformation("Structured output: disableThinkingForResponseFormat={Enabled}",
             structuredOutput.DisableThinkingForResponseFormat);
+        log.LogInformation("Sampling override: temperature={Temperature} top_p={TopP} (null = pass-through, caller sampling wins)",
+            options.PrimaryBackend.Temperature, options.PrimaryBackend.TopP);
 
         app.MapPost("v1/chat/completions", HandleChatCompletion);
         app.MapPost("chat/completions", HandleChatCompletion);
@@ -121,7 +123,7 @@ public class Program
             {
                 ok = true,
                 phase = "observation",
-                primary = new { url = options.PrimaryBackend.BaseUrl },
+                primary = new { url = options.PrimaryBackend.BaseUrl, temperature = (double?)options.PrimaryBackend.Temperature, topP = (double?)options.PrimaryBackend.TopP },
                 fast = new { url = options.FastBackend.BaseUrl, enabled = false },
                 heavy = new { url = options.HeavyBackend.BaseUrl, enabled = false },
                 systemPromptThresholdBytes = options.SystemPromptThresholdBytes,
