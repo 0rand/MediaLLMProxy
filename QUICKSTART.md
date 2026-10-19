@@ -9,12 +9,13 @@ prompt injection) you can adapt.
 
 ## 1. Configuration layering
 
-The proxy uses standard .NET configuration binding. Three layers, later wins:
+The proxy uses standard .NET configuration binding. Later layers win:
 
 ```
-1. appsettings.json        → checked-in defaults (repo)
-2. appsettings.<ENV>.json  → per-environment overrides (rarely used)
-3. Environment variables   → deployment config (keys, URLs, guards) — WINS
+1. appsettings.json        → base configuration in the process working directory
+2. appsettings.<ENV>.json  → selected by ASPNETCORE_ENVIRONMENT
+3. Environment variables   → override JSON configuration
+4. Command-line options    → override the preceding layers
 ```
 
 **Rule of thumb:**
@@ -22,12 +23,17 @@ The proxy uses standard .NET configuration binding. Three layers, later wins:
 | What | Where it belongs |
 |---|---|
 | Endpoint URLs, model ids, thresholds, cache, URL policy | `appsettings.json` (non-secret defaults) |
-| API keys, real backend URLs, guard prompts, per-deployment tweaks | **environment variables** (never JSON) |
+| Non-secret endpoint URLs, guard settings, per-deployment tweaks | per-environment JSON or environment variables |
 | Anything secret | environment variables only — never commit |
 
 Env var naming: the JSON path becomes `__`-separated uppercase:
 `RoutingOptions.PrimaryBackend.BaseUrl` → `RoutingOptions__PrimaryBackend__BaseUrl`.
 `MultimodalOptions.Enabled` → `MultimodalOptions__Enabled`.
+
+For systemd, the unit's `WorkingDirectory` is the configuration root. A file in
+the binary's `bin/` directory is not read unless that is also the working
+directory. Options are read once at startup; edits require a restart. Features
+added in code also require deploying the updated binary before restarting.
 
 ---
 
@@ -36,25 +42,34 @@ Env var naming: the JSON path becomes `__`-separated uppercase:
 ```json
 {
   "RoutingOptions": {
-    "ListenUrl": "http://0.0.0.0:7071",      // bind address
-    "PrimaryBackend": { "BaseUrl": "http://localhost:8000" },
+    "ListenUrl": "http://0.0.0.0:7071",
+    "PrimaryBackend": {
+      "BaseUrl": "http://localhost:8000",
+      "CureRawToolCalls": false
+    },
     "FastBackend":  { "BaseUrl": "http://localhost:8000", "MaxConcurrentConnections": 2 },
     "HeavyBackend": { "BaseUrl": "http://localhost:8000", "MaxConcurrentConnections": 2 },
-    "SystemPromptThresholdBytes": 100000,     // lane routing thresholds (phase-1: unused)
+    "SystemPromptThresholdBytes": 100000,
     "FastLaneThresholdBytes": 65536,
-    "LogDecisions": true,                      // log lane decisions
-    "LogBodies": false,                        // deprecated (see VerboseRequests)
-    "VerboseRequests": false                   // log incoming request bodies
+    "LogDecisions": true,
+    "LogBodies": false,
+    "VerboseRequests": false
   },
   "MultimodalOptions": {
-    "Enabled": false,                          // master bridge switch — flip to true
+    "Enabled": false,
     "VisionBackend": { "BaseUrl": "http://localhost:8000" },
     "VisionModel": "Qwen3.6-35B-A3B-MLX-VL-oQ8",
-    "MaxObservationTokens": 512,               // observation length cap
-    "TimeoutSeconds": 90,                      // vision detour timeout
-    "CacheTtlHours": 24,                       // byte-keyed observation cache
+    "MaxObservationTokens": 2048,
+    "TimeoutSeconds": 90,
+    "CacheTtlHours": 24,
     "CacheCapacity": 512,
     "UrlPolicy": { "AllowDataUrls": true, "AllowHttpsHosts": [], "MaxMediaBytes": 5000000 }
+  },
+  "UnavailableToolRetryOptions": {
+    "Enabled": false,
+    "MaxRetries": 1,
+    "RetryRawToolCallAborts": true,
+    "MaxResponseBytes": 16777216
   }
 }
 ```
@@ -77,6 +92,12 @@ file is the right home for stable, non-secret defaults (e.g. vision model id).
 | `RoutingOptions__PrimaryBackend__InjectedSystemPromptPath` | guard prompt from a file (wins over inline; missing file aborts startup) |
 | `RoutingOptions__PrimaryBackend__Temperature` | text sampling override — forced on every request, beats client values (null = leave client's) |
 | `RoutingOptions__PrimaryBackend__TopP` | text sampling override — forced on every request, beats client values (null = leave client's) |
+| `RoutingOptions__PrimaryBackend__CureRawToolCalls` | false by default; convert supported raw DSML/XML content to standard `tool_calls` |
+| `UnavailableToolRetryOptions__Enabled` | false by default; recover once from rejected tool calls with a corrective user-message banner |
+| `UnavailableToolRetryOptions__MaxRetries` | shared retry budget across both rejection types; defaults to 1 and is capped at 1 |
+| `UnavailableToolRetryOptions__RetryRawToolCallAborts` | true by default; include proxy raw-tool rejections when recovery and curing are enabled |
+| `UnavailableToolRetryOptions__MaxResponseBytes` | response buffer limit per eligible attempt, default 16777216 bytes (16 MiB) |
+| `UnavailableToolRetryOptions__Banner` / `RawToolCallBanner` | corrective text for unavailable tools / rejected raw markup |
 | `RoutingOptions__VerboseRequests` | log incoming bodies (debug) |
 | `RoutingOptions__VerboseRewrites` | log the rewritten body actually sent to the text model |
 | `MultimodalOptions__Enabled` | master bridge switch (true to bridge images) |
@@ -96,9 +117,9 @@ file is the right home for stable, non-secret defaults (e.g. vision model id).
 
 ---
 
-## 4. Full example — the current production configuration
+## 4. Full example — cloud text and local vision
 
-This is the live configuration used by the authors (2026-08): text = DeepSeek GA
+This is a historical production profile (2026-08): text = DeepSeek GA
 (cloud, text-only), vision = local oMLX serving Qwen-VL (images never leave the
 machine for the *seeing*), guard prompt injected from a file. Adapt the URLs.
 
@@ -164,6 +185,33 @@ curl -s http://localhost:7071/v1/chat/completions -H "Content-Type: application/
 # 4. image path (with VerboseRewrites=true watch the log: BRIDGE → FORWARD)
 #    the response header X-PreRouter-Media: image confirms the bridge fired
 ```
+
+For DeepSeek DSML/XML tool recovery, enable both
+`RoutingOptions.PrimaryBackend.CureRawToolCalls` and
+`UnavailableToolRetryOptions.Enabled`. The complete opt-in profile is
+[`examples/appsettings.tool-recovery.json`](examples/appsettings.tool-recovery.json).
+It listens on loopback port 7071 and forwards to a backend on port 8100; neither
+the sample nor a test instance needs to bind production port 8000.
+
+After deployment/restart, `/health` should include:
+
+```json
+{
+  "primary": { "cureRawToolCalls": true },
+  "unavailableToolRetry": {
+    "enabled": true,
+    "maxRetries": 1,
+    "retryRawToolCallAborts": true,
+    "maxResponseBytes": 16777216
+  }
+}
+```
+
+The retry object is **top-level**, not nested inside `primary` or `loopGuard`.
+If absent, check the deployed build and endpoint. If present but disabled,
+check config precedence and whether the process restarted. Full behavior,
+buffering costs, banner settings, error contracts and observability are in
+[Tool-Call Recovery](docs/TOOL-CALL-RECOVERY.md).
 
 ---
 

@@ -10,6 +10,13 @@ services:
       RoutingOptions__PrimaryBackend__BaseUrl: "http://host.docker.internal:8000"
       RoutingOptions__PrimaryBackend__RewriteModel: "your-text-model"
       RoutingOptions__PrimaryBackend__ModelAlias: "main"
+      # Opt in to both settings for bounded DSML/XML tool-call recovery.
+      # Eligible responses are buffered; see docs/TOOL-CALL-RECOVERY.md.
+      RoutingOptions__PrimaryBackend__CureRawToolCalls: "false"
+      UnavailableToolRetryOptions__Enabled: "false"
+      UnavailableToolRetryOptions__MaxRetries: "1"
+      UnavailableToolRetryOptions__RetryRawToolCallAborts: "true"
+      UnavailableToolRetryOptions__MaxResponseBytes: "16777216"
       MultimodalOptions__Enabled: "true"
       MultimodalOptions__VisionBackend__BaseUrl: "http://host.docker.internal:8001"
       MultimodalOptions__VisionModel: "your-vision-model"

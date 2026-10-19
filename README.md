@@ -317,6 +317,13 @@ Everything is environment variables (`.NET` config binding) or
 | `LoopGuardOptions__WedgeReasoningMode` | Prior-reasoning inclusion: `summary` (default — 3B distills in the judge call) \| `verbatim` (raw, capped) \| `none` |
 | `LoopGuardOptions__WedgeBanner` | Banner prepended to the re-issued stream (visible to the user AND persisted) |
 | `LoopGuardOptions__InjectionMarker` | Marker prepended to the injected nudge (marks it as a system-side note, not a user instruction) |
+| `UnavailableToolRetryOptions__Enabled` | false (default). Retry a rejected model response once with a corrective user-turn banner. Covers stack `unavailable_tool_call` errors and proxy raw-tool rejections when curing is enabled. |
+| `UnavailableToolRetryOptions__MaxRetries` | Shared retry budget. Default 1, capped at 1 even if configured higher; 0 disables re-issues. |
+| `UnavailableToolRetryOptions__Banner` | Banner text appended as a new user message on the retry request (sent upstream only, never persisted client-side) |
+| `UnavailableToolRetryOptions__InjectionMarker` | Marker prepended to the banner (marks it as a system-side retry note, not a user instruction) |
+| `UnavailableToolRetryOptions__RetryRawToolCallAborts` | true (default). Include proxy raw-tool validation failures in the shared retry policy. Requires `Enabled` and `PrimaryBackend.CureRawToolCalls`. |
+| `UnavailableToolRetryOptions__RawToolCallBanner` | Corrective banner for malformed, incomplete or disallowed raw tool calls. Requests complete valid calls using only offered tools, without repeating rejected markup. |
+| `UnavailableToolRetryOptions__MaxResponseBytes` | Maximum response bytes buffered per attempt. Default 16777216 (16 MiB). Oversized responses fail rather than triggering a model retry. |
 | `MultimodalOptions__VisionBackend__ApiKey` | primary vision API token (omit for unauthenticated local inference) |
 | `MultimodalOptions__VisionModel` | primary vision model id |
 | `MultimodalOptions__VisionFallbackBackend__BaseUrl` | optional failure-only fallback vision endpoint |
@@ -331,7 +338,8 @@ Everything is environment variables (`.NET` config binding) or
 | `MultimodalOptions__CacheTtlHours` / `CacheCapacity` | observation cache |
 | `RoutingOptions__VerboseRequests` / `VerboseRewrites` | log incoming body / rewritten body |
 
-See `docs/ARCHITECTURE.md` for the full design, request flow, and operational notes.
+See [QUICKSTART.md](QUICKSTART.md) for configuration layering and
+[Tool-Call Recovery](docs/TOOL-CALL-RECOVERY.md) for recovery behavior and operations.
 
 ### Vision deployment profiles
 
@@ -460,6 +468,82 @@ It does not repair calls to undeclared tools or invent missing arguments.
 
 Adapted from [opencode_compat_proxy](https://github.com/0rand/opencode_compat_proxy),
 with attribution in `THIRD-PARTY-NOTICES.md`.
+
+### Rejected tool-call recovery
+
+The DeepSeek-V4.1 stack rejects a complete tool call that names a tool not
+offered by the request. Non-streaming requests get HTTP 500 with
+`error.code: "unavailable_tool_call"`; streaming requests get HTTP 200 with one
+SSE error frame and `[DONE]`. This is correct safety behavior, but it stops an
+autonomous agent loop.
+
+Opt in to a one-shot retry:
+
+```bash
+export UnavailableToolRetryOptions__Enabled=true
+```
+
+In JSON, enable the recovery policy alongside curing:
+
+```json
+{
+  "RoutingOptions": {
+    "PrimaryBackend": {
+      "CureRawToolCalls": true
+    }
+  },
+  "UnavailableToolRetryOptions": {
+    "Enabled": true,
+    "MaxRetries": 1,
+    "RetryRawToolCallAborts": true
+  }
+}
+```
+
+Deploy the updated binary and restart the proxy. For the stack's explicit
+`model_output_error` / `unavailable_tool_call` error, recovery appends a new user
+message carrying `InjectionMarker` + `Banner` (default: use only offered tools).
+For a proxy raw-tool validation failure, it uses `RawToolCallBanner` instead:
+retry the original task with complete valid calls and required arguments, using
+only offered tools and not repeating the rejected markup.
+
+Both failures share **one** retry budget, even if the retry fails for a different
+reason. The retry starts from the original forwarded request, not the failed
+assistant output, and adds exactly one user-turn banner. Thinking, sampling,
+tool schemas and `tool_choice` remain unchanged. The banner is sent upstream
+only; it is not added to the response or the client's conversation history.
+Requests without a non-empty `tools` array are not retried. Authentication,
+network and unrelated backend failures do not trigger this recovery.
+
+A second stack rejection passes through as an error. A second proxy raw-tool
+rejection becomes `model_output_error` / `invalid_raw_tool_call`: HTTP 502 JSON
+for non-streaming, or a single SSE error frame followed by `[DONE]` for streaming.
+Rejected raw arguments and successful finish chunks are not emitted. This avoids
+the connection reset caused by the unbuffered cure filter's abort path. With
+recovery disabled, the existing cure-only abort behavior remains unchanged.
+
+`/health` reports the gate under `unavailableToolRetry.enabled`; retries are
+logged as `TOOL_RETRY reason=unavailable_tool_call|invalid_raw_tool_call` and counted
+in the shared `unavailable_tool_retries`, `unavailable_tool_retry_success` and
+`unavailable_tool_retry_fail` counters. `X-PreRouter-Tool-Retries` reports actual
+re-issues; `X-PreRouter-Tool-Rejected` identifies a final rejection.
+
+`unavailableToolRetry` is a **top-level** health object, separate from
+`primary.cureRawToolCalls`. If that object is absent, verify the endpoint and
+deployed binary: restarting an old binary with new JSON keys does not add the
+feature. See the [operations guide](docs/TOOL-CALL-RECOVERY.md#health-and-logs).
+An opt-in JSON profile is in
+[`examples/appsettings.tool-recovery.json`](examples/appsettings.tool-recovery.json).
+
+This follows the loop guard's corrective-message approach, without its LLM judge
+or thinking-mode override. Each eligible response is buffered and validated
+before being forwarded, so reasoning or executable calls from a failed attempt
+cannot leak to the client. `MaxResponseBytes` bounds each attempt's buffer
+(16 MiB by default). This delays the first response bytes until validation;
+clients must allow enough time for up to two generations. The mid-turn loop-guard
+wedge is bypassed for these buffered requests to avoid an additional unvalidated
+generation. Request-side loop-guard nudges and successful-response media
+observations still apply.
 
 ### Native-vision passthrough mode (natively multimodal primary models)
 
