@@ -83,4 +83,7 @@ public record BackendConfig
     /// client sent. Null (default) = leave the client's value untouched.
     /// </summary>
     public double? TopP { get; init; }
+
+    /// <summary>Convert leaked DSML/Qwen XML content into tool_calls for tools declared by the request.</summary>
+    public bool CureRawToolCalls { get; init; } = false;
 }

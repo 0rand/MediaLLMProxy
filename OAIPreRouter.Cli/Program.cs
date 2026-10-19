@@ -69,10 +69,17 @@ public class Program
 
         log.LogInformation("OAIPreRouter starting — PHASE 1: observation mode (all requests → primary)");
         log.LogInformation("PrimaryBackend: {Url}", options.PrimaryBackend.BaseUrl);
+        log.LogInformation("Raw tool-call curing: enabled={Enabled}", options.PrimaryBackend.CureRawToolCalls);
         log.LogInformation("FastBackend: {Url} (disabled in phase 1)", options.FastBackend.BaseUrl);
         log.LogInformation("HeavyBackend: {Url} (disabled in phase 1)", options.HeavyBackend.BaseUrl);
         log.LogInformation("SystemPromptThresholdBytes: {Threshold}", options.SystemPromptThresholdBytes);
         log.LogInformation("FastLaneThresholdBytes: {Threshold}", options.FastLaneThresholdBytes);
+        log.LogInformation("Sampling: temperature={Temperature} top_p={TopP} ({Mode})",
+            options.PrimaryBackend.Temperature is double t ? t.ToString(System.Globalization.CultureInfo.InvariantCulture) : "unset",
+            options.PrimaryBackend.TopP is double p ? p.ToString(System.Globalization.CultureInfo.InvariantCulture) : "unset",
+            options.PrimaryBackend.Temperature is not null || options.PrimaryBackend.TopP is not null
+                ? "enforced on every chat request, applied last (client values overridden)"
+                : "no pins — client sampling passes through untouched");
 
         // === Multimodal bridge startup validation ===
         if (multimodal.Enabled)
@@ -123,7 +130,19 @@ public class Program
             {
                 ok = true,
                 phase = "observation",
-                primary = new { url = options.PrimaryBackend.BaseUrl, temperature = (double?)options.PrimaryBackend.Temperature, topP = (double?)options.PrimaryBackend.TopP },
+                primary = new
+                {
+                    url = options.PrimaryBackend.BaseUrl,
+                    temperature = (double?)options.PrimaryBackend.Temperature,
+                    topP = (double?)options.PrimaryBackend.TopP,
+                    cureRawToolCalls = options.PrimaryBackend.CureRawToolCalls,
+                    sampling = (object?)new
+                    {
+                        temperature = options.PrimaryBackend.Temperature,
+                        top_p = options.PrimaryBackend.TopP,
+                        enforced = options.PrimaryBackend.Temperature is not null || options.PrimaryBackend.TopP is not null
+                    }
+                },
                 fast = new { url = options.FastBackend.BaseUrl, enabled = false },
                 heavy = new { url = options.HeavyBackend.BaseUrl, enabled = false },
                 systemPromptThresholdBytes = options.SystemPromptThresholdBytes,
@@ -241,10 +260,49 @@ public class Program
             // === Sampling override: enforce configured temperature/top_p on the text backend ===
             // Mirrors opencode-compat-proxy (enforce_mimo_main_params / enforce_ds4f_params):
             // applied LAST so configured sampling cannot be superseded by the caller.
+            // Each application is logged with the client's value and the enforced value so
+            // the forwarded sampling is auditable without a wire capture.
+            var samplingNotes = new List<string>();
             if (backend.Temperature is double temp)
-                body = JsonBodyRewriter.TryRewriteSampling(body, "temperature", temp) ?? body;
+            {
+                var clientTemp = JsonFieldReader.TryReadTopLevelNumber(body, "temperature");
+                var rewritten = JsonBodyRewriter.TryRewriteSampling(body, "temperature", temp);
+                if (rewritten is null)
+                {
+                    metrics.SamplingParseFail();
+                    samplingNotes.Add($"temperature: parse-fail, client value kept (enforce {temp})");
+                }
+                else
+                {
+                    body = rewritten;
+                    metrics.SamplingPinned();
+                    samplingNotes.Add(clientTemp is double ct
+                        ? $"temperature: {ct} -> {temp}"
+                        : $"temperature: absent -> {temp}");
+                }
+            }
             if (backend.TopP is double topP)
-                body = JsonBodyRewriter.TryRewriteSampling(body, "top_p", topP) ?? body;
+            {
+                var clientTopP = JsonFieldReader.TryReadTopLevelNumber(body, "top_p");
+                var rewritten = JsonBodyRewriter.TryRewriteSampling(body, "top_p", topP);
+                if (rewritten is null)
+                {
+                    metrics.SamplingParseFail();
+                    samplingNotes.Add($"top_p: parse-fail, client value kept (enforce {topP})");
+                }
+                else
+                {
+                    body = rewritten;
+                    metrics.SamplingPinned();
+                    samplingNotes.Add(clientTopP is double cp
+                        ? $"top_p: {cp} -> {topP}"
+                        : $"top_p: absent -> {topP}");
+                }
+            }
+            if (samplingNotes.Count > 0)
+                log.LogInformation("[{RequestId}] SAMPLING {Notes}", requestId, string.Join("; ", samplingNotes));
+            else
+                metrics.SamplingKept();
             var targetUri = JoinUrl(backend.BaseUrl, "/v1/chat/completions");
 
             // === Structured Detection Log ===
@@ -756,58 +814,82 @@ public class Program
                 try
                 {
                     var isStreaming = JsonFieldReader.TryReadTopLevelBool(body, "stream") ?? false;
-                    if (loopGuard.Enabled && loopGuard.WedgeEnabled && isStreaming)
+                    var toolNames = backend.CureRawToolCalls ? RawToolCallCure.AllowedNames(forwarded) : new HashSet<string>();
+                    var cure = backend.CureRawToolCalls && toolNames.Count > 0 && upstream.IsSuccessStatusCode;
+                    if (cure && isStreaming)
+                        await SseToolCallCure.PipeAsync(ForwardResponse, ctx.Response.Body, toolNames, ctx.RequestAborted,
+                            count => log.LogInformation("[{RequestId}] TOOL_CALL_CURE converted {Count} raw tool calls (streaming)", requestId, count));
+                    else if (cure)
                     {
-                        // Mid-turn wedge: watch reasoning growth; on judge NUDGE, re-issue
-                        // with thinking OFF + prior-reasoning context, stream to the SAME
-                        // client connection. Fail-open inside the processor.
-                        var wedgeSw = Stopwatch.StartNew();
-                        await SseWedgeProcessor.ProcessAsync(
-                            responseStream, ctx.Response.Body, loopGuard,
-                            judge: reasoning => LoopGuardService.JudgeWedgeAsync(reasoning, loopGuard, obsCache,
-                                httpClientFactory.CreateClient("loopguard"), ctx.RequestAborted),
-                            makeAttempt2: async (reasoning, nudge, summary) =>
-                            {
-                                var wedgedBody = LoopGuardService.BuildWedgeBody(forwarded, nudge, summary, reasoning, loopGuard);
-                                if (wedgedBody == null) return null;
-                                using var outbound2 = new HttpRequestMessage(HttpMethod.Post, targetUri);
-                                outbound2.Content = new StringContent(wedgedBody, Encoding.UTF8, "application/json");
-                                CopyHeaders(ctx, outbound2, backend);
-                                var client2 = httpClientFactory.CreateClient("proxy");
-                                var resp2 = await client2.SendAsync(outbound2, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
-                                if (!resp2.IsSuccessStatusCode) { resp2.Dispose(); return null; }
-                                return await resp2.Content.ReadAsStreamAsync(ctx.RequestAborted);
-                            },
-                            abortAttempt1: () => upstream.Dispose(),
-                            ctx.RequestAborted);
-                        wedgeSw.Stop();
-                        metrics.LoopGuardWedge();
-                        metrics.LoopGuardWedgeMs(wedgeSw.ElapsedMilliseconds);
-                        log.LogInformation("[{RequestId}] LOOPGUARD wedge processed ({ElapsedMs}ms)", requestId, wedgeSw.ElapsedMilliseconds);
+                        ctx.Response.ContentType = upstream.Content.Headers.ContentType?.ToString() ?? "application/json";
+                        var full = await new StreamReader(responseStream, Encoding.UTF8).ReadToEndAsync(ctx.RequestAborted);
+                        var rewritten = RawToolCallCure.RewriteJson(full, toolNames);
+                        if (rewritten != full)
+                            log.LogInformation("[{RequestId}] TOOL_CALL_CURE converted raw tool markup (non-streaming)", requestId);
+                        if (observationBlock != null)
+                            rewritten = JsonBodyRewriter.TryAppendObservationToJson(rewritten, observationBlock) ?? rewritten;
+                        await ctx.Response.WriteAsync(rewritten, ctx.RequestAborted);
                     }
-                    else if (observationBlock != null)
+                    else
+                        await ForwardResponse(ctx.Response.Body);
+
+                    async Task ForwardResponse(Stream destination)
                     {
-                        if (isStreaming)
+                        if (loopGuard.Enabled && loopGuard.WedgeEnabled && isStreaming)
                         {
-                            await SseObservationInjector.InjectAsync(responseStream, ctx.Response.Body, observationBlock, ctx.RequestAborted);
+                            // Mid-turn wedge: watch reasoning growth; on judge NUDGE, re-issue
+                            // with thinking OFF + prior-reasoning context, stream to the SAME
+                            // client connection. Fail-open inside the processor.
+                            var wedgeSw = Stopwatch.StartNew();
+                            await SseWedgeProcessor.ProcessAsync(
+                                responseStream, destination, loopGuard,
+                                judge: reasoning => LoopGuardService.JudgeWedgeAsync(reasoning, loopGuard, obsCache,
+                                    httpClientFactory.CreateClient("loopguard"), ctx.RequestAborted),
+                                makeAttempt2: async (reasoning, nudge, summary) =>
+                                {
+                                    var wedgedBody = LoopGuardService.BuildWedgeBody(forwarded, nudge, summary, reasoning, loopGuard);
+                                    if (wedgedBody == null) return null;
+                                    using var outbound2 = new HttpRequestMessage(HttpMethod.Post, targetUri);
+                                    outbound2.Content = new StringContent(wedgedBody, Encoding.UTF8, "application/json");
+                                    CopyHeaders(ctx, outbound2, backend);
+                                    var client2 = httpClientFactory.CreateClient("proxy");
+                                    var resp2 = await client2.SendAsync(outbound2, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
+                                    if (!resp2.IsSuccessStatusCode) { resp2.Dispose(); return null; }
+                                    return await resp2.Content.ReadAsStreamAsync(ctx.RequestAborted);
+                                },
+                                abortAttempt1: () => upstream.Dispose(),
+                                ctx.RequestAborted);
+                            wedgeSw.Stop();
+                            metrics.LoopGuardWedge();
+                            metrics.LoopGuardWedgeMs(wedgeSw.ElapsedMilliseconds);
+                            log.LogInformation("[{RequestId}] LOOPGUARD wedge processed ({ElapsedMs}ms)", requestId, wedgeSw.ElapsedMilliseconds);
+                        }
+                        else if (observationBlock != null)
+                        {
+                            if (isStreaming)
+                            {
+                                await SseObservationInjector.InjectAsync(responseStream, destination, observationBlock, ctx.RequestAborted);
+                            }
+                            else
+                            {
+                                var full = await new StreamReader(responseStream, Encoding.UTF8).ReadToEndAsync(ctx.RequestAborted);
+                                var rewritten = JsonBodyRewriter.TryAppendObservationToJson(full, observationBlock);
+                                if (rewritten == null)
+                                    log.LogWarning("[{RequestId}] BRIDGE response block append FAILED (non-streaming) — observation not persisted", requestId);
+                                await destination.WriteAsync(Encoding.UTF8.GetBytes(rewritten ?? full), ctx.RequestAborted);
+                            }
                         }
                         else
                         {
-                            var full = await new StreamReader(responseStream, Encoding.UTF8).ReadToEndAsync(ctx.RequestAborted);
-                            var rewritten = JsonBodyRewriter.TryAppendObservationToJson(full, observationBlock);
-                            if (rewritten == null)
-                                log.LogWarning("[{RequestId}] BRIDGE response block append FAILED (non-streaming) — observation not persisted", requestId);
-                            await ctx.Response.WriteAsync(rewritten ?? full, ctx.RequestAborted);
+                            await responseStream.CopyToAsync(destination, ctx.RequestAborted);
                         }
-                    }
-                    else
-                    {
-                        await responseStream.CopyToAsync(ctx.Response.Body, ctx.RequestAborted);
                     }
                 }
                 catch (Exception streamEx) when (!streamEx.IsOperationCanceled())
                 {
                     log.LogError(streamEx, "[{RequestId}] STREAM_ERROR elapsedMs={ElapsedMs}", requestId, sw.ElapsedMilliseconds);
+                    if (options.PrimaryBackend.CureRawToolCalls)
+                        ctx.Abort(); // Do not turn an invalid/truncated tool call into a successful completion.
                 }
             }
             catch (OperationCanceledException ex) when (ctx.RequestAborted.IsCancellationRequested)

@@ -15,6 +15,9 @@ public sealed class BridgeMetrics
     private long _sttOk;
     private long _sttFail;
     private long _rehomeOk;
+    private long _samplingPinned;
+    private long _samplingKept;
+    private long _samplingParseFail;
     private long _loopGuardChecks;
     private long _loopGuardNudges;
     private long _loopGuardErrors;
@@ -32,6 +35,9 @@ public sealed class BridgeMetrics
     public void SttOk() => Interlocked.Increment(ref _sttOk);
     public void SttFail() => Interlocked.Increment(ref _sttFail);
     public void RehomeOk() => Interlocked.Increment(ref _rehomeOk);
+    public void SamplingPinned() => Interlocked.Increment(ref _samplingPinned);
+    public void SamplingKept() => Interlocked.Increment(ref _samplingKept);
+    public void SamplingParseFail() => Interlocked.Increment(ref _samplingParseFail);
     public void LoopGuardCheck() => Interlocked.Increment(ref _loopGuardChecks);
     public void LoopGuardNudge() => Interlocked.Increment(ref _loopGuardNudges);
     public void LoopGuardError() => Interlocked.Increment(ref _loopGuardErrors);
@@ -51,6 +57,9 @@ public sealed class BridgeMetrics
         stt_ok = Interlocked.Read(ref _sttOk),
         stt_fail = Interlocked.Read(ref _sttFail),
         rehome_ok = Interlocked.Read(ref _rehomeOk),
+        sampling_pinned = Interlocked.Read(ref _samplingPinned),
+        sampling_kept = Interlocked.Read(ref _samplingKept),
+        sampling_parse_fail = Interlocked.Read(ref _samplingParseFail),
         loop_guard_checks = Interlocked.Read(ref _loopGuardChecks),
         loop_guard_nudges = Interlocked.Read(ref _loopGuardNudges),
         loop_guard_errors = Interlocked.Read(ref _loopGuardErrors),
