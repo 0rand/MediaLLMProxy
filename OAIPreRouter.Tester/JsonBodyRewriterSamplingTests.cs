@@ -68,3 +68,42 @@ public class JsonBodyRewriterSamplingTests
         Assert.Null(rewritten);
     }
 }
+
+public class JsonFieldReaderNumberTests
+{
+    [Fact]
+    public void TryReadTopLevelNumber_PresentNumber_ReturnsValue()
+    {
+        const string body = """{"model":"m","temperature":0.7,"messages":[]}""";
+        Assert.Equal(0.7, JsonFieldReader.TryReadTopLevelNumber(body, "temperature"));
+    }
+
+    [Fact]
+    public void TryReadTopLevelNumber_Absent_ReturnsNull()
+    {
+        const string body = """{"model":"m","messages":[]}""";
+        Assert.Null(JsonFieldReader.TryReadTopLevelNumber(body, "temperature"));
+    }
+
+    [Fact]
+    public void TryReadTopLevelNumber_NonNumberKind_ReturnsNull()
+    {
+        // A string temperature is not a number — the reader must not throw or coerce.
+        const string body = """{"model":"m","temperature":"high","messages":[]}""";
+        Assert.Null(JsonFieldReader.TryReadTopLevelNumber(body, "temperature"));
+    }
+
+    [Fact]
+    public void TryReadTopLevelNumber_InvalidJson_ReturnsNull()
+    {
+        Assert.Null(JsonFieldReader.TryReadTopLevelNumber("{ not json", "temperature"));
+    }
+
+    [Fact]
+    public void TryReadTopLevelNumber_Integer_Form_ReturnsValue()
+    {
+        // Some clients send integer sampling values; GetDouble handles them.
+        const string body = """{"model":"m","top_p":1,"messages":[]}""";
+        Assert.Equal(1.0, JsonFieldReader.TryReadTopLevelNumber(body, "top_p"));
+    }
+}
