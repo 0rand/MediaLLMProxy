@@ -558,6 +558,48 @@ public static class JsonBodyRewriter
         }
     }
 
+    /// <summary>
+    /// Appends a NEW user message at the end of the conversation. Used by the
+    /// unavailable-tool retry: the banner is a user turn, never a system instruction,
+    /// and is only sent on the retry request (never persisted client-side).
+    /// Returns null when the body has no messages array (nothing to append to).
+    /// </summary>
+    public static string? TryAppendUserMessage(string json, string marker, string text)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("messages", out var messages) ||
+                messages.ValueKind != JsonValueKind.Array)
+                return null;
+
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                writer.WriteStartObject();
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (!prop.NameEquals("messages")) { prop.WriteTo(writer); continue; }
+                    writer.WritePropertyName("messages");
+                    writer.WriteStartArray();
+                    foreach (var m in messages.EnumerateArray())
+                        m.WriteTo(writer);
+                    writer.WriteStartObject();
+                    writer.WriteString("role", "user");
+                    writer.WriteString("content", marker + text);
+                    writer.WriteEndObject();
+                    writer.WriteEndArray();
+                }
+                writer.WriteEndObject();
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static void WriteRewrittenContent(Utf8JsonWriter writer, JsonElement content, int messageIndex,
         HashSet<(int msgIdx, int partIdx)> stripSet,
         IReadOnlyDictionary<int, string> observationsByMessageIndex,

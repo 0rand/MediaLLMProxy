@@ -29,6 +29,7 @@ public class Program
         builder.Services.Configure<RoutingOptions>(builder.Configuration.GetSection(RoutingOptions.ConfigSection));
         builder.Services.Configure<MultimodalOptions>(builder.Configuration.GetSection(MultimodalOptions.ConfigSection));
         builder.Services.Configure<LoopGuardOptions>(builder.Configuration.GetSection(LoopGuardOptions.ConfigSection));
+        builder.Services.Configure<UnavailableToolRetryOptions>(builder.Configuration.GetSection(UnavailableToolRetryOptions.ConfigSection));
         builder.Services.AddSingleton<ConnectionLimiter>();
         builder.Services.AddSingleton<ObservationCache>();
         builder.Services.AddSingleton<BridgeMetrics>();
@@ -60,6 +61,7 @@ public class Program
         var log = app.Logger;
         var multimodal = app.Services.GetRequiredService<IOptions<MultimodalOptions>>().Value;
         var loopGuard = app.Services.GetRequiredService<IOptions<LoopGuardOptions>>().Value;
+        var unavailableToolRetry = app.Services.GetRequiredService<IOptions<UnavailableToolRetryOptions>>().Value;
         var visionDetour = app.Services.GetRequiredService<VisionDetourClient>();
         var sttDetour = app.Services.GetRequiredService<SttDetourClient>();
         var obsCache = app.Services.GetRequiredService<ObservationCache>();
@@ -114,6 +116,8 @@ public class Program
             loopGuard.Enabled, loopGuard.ReasoningTokenThreshold,
             string.IsNullOrWhiteSpace(loopGuard.AdvisorBackend.BaseUrl) ? "none" : loopGuard.AdvisorBackend.BaseUrl,
             !string.IsNullOrWhiteSpace(loopGuard.StaticNudge));
+        log.LogInformation("UnavailableToolRetry: enabled={Enabled} maxRetries={MaxRetries} rawToolAborts={RawToolAborts}",
+            unavailableToolRetry.Enabled, Math.Clamp(unavailableToolRetry.MaxRetries, 0, 1), unavailableToolRetry.RetryRawToolCallAborts);
 
         app.MapPost("v1/chat/completions", HandleChatCompletion);
         app.MapPost("chat/completions", HandleChatCompletion);
@@ -142,7 +146,8 @@ public class Program
                 bridge = multimodal.Enabled
                     ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)metrics.Snapshot() }
                     : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)null },
-                loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)loopGuard.AdvisorBackend.BaseUrl, model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() }
+                loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)loopGuard.AdvisorBackend.BaseUrl, model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() },
+                unavailableToolRetry = new { enabled = unavailableToolRetry.Enabled, maxRetries = Math.Clamp(unavailableToolRetry.MaxRetries, 0, 1), retryRawToolCallAborts = unavailableToolRetry.RetryRawToolCallAborts, maxResponseBytes = unavailableToolRetry.MaxResponseBytes, metrics = (object?)metrics.Snapshot() }
             });
         });
 
@@ -737,25 +742,39 @@ public class Program
 
             // === Pass-through: body is forwarded as-is ===
             var forwarded = loopGuardBody ?? forwardBody ?? body;
-            using var outbound = new HttpRequestMessage(HttpMethod.Post, targetUri);
-            outbound.Content = new StringContent(forwarded, Encoding.UTF8, "application/json");
-
-            CopyHeaders(ctx, outbound, backend);
-
             var client = httpClientFactory.CreateClient("proxy");
 
             try
             {
-                using var upstream = await client.SendAsync(outbound, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
-
+                var isStreaming = JsonFieldReader.TryReadTopLevelBool(body, "stream") ?? false;
+                var retryEnabled = unavailableToolRetry.Enabled &&
+                                   UnavailableToolRetryService.HasDeclaredTools(forwarded);
+                using var upstream = await UnavailableToolRetryService.SendAsync(
+                    async (requestBody, ct) =>
+                    {
+                        using var request = new HttpRequestMessage(HttpMethod.Post, targetUri);
+                        request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
+                        CopyHeaders(ctx, request, backend);
+                        return await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+                    }, forwarded, isStreaming, backend.CureRawToolCalls, unavailableToolRetry, metrics, ctx.RequestAborted,
+                    code => log.LogInformation("[{RequestId}] TOOL_RETRY reason={Code}; refiring once with corrective user banner", requestId, code));
                 sw.Stop();
 
                 log.LogInformation(
                     "[{RequestId}] UPSTREAM status={StatusCode} elapsedMs={ElapsedMs} target={Target}",
                     requestId, (int)upstream.StatusCode, sw.ElapsedMilliseconds, targetUri);
 
+                await using var responseStream = await upstream.Content.ReadAsStreamAsync(ctx.RequestAborted);
+
+                if (responseStream == null)
+                {
+                    ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                    await ctx.Response.WriteAsJsonAsync(new { error = "Failed to read upstream response stream." });
+                    return Results.Empty;
+                }
+
                 ctx.Response.StatusCode = (int)upstream.StatusCode;
-                ctx.Response.ContentType = "text/event-stream"; // SSE — clients need it to decode lines (requests.iter_lines(decode_unicode=True) yields bytes without it)
+                ctx.Response.ContentType = upstream.Content.Headers.ContentType?.ToString() ?? (isStreaming ? "text/event-stream" : "application/json");
                 ctx.Response.Headers["X-PreRouter-Detect"] = detectionType;
                 ctx.Response.Headers["X-PreRouter-Intended-Lane"] = intendedLane;
                 ctx.Response.Headers["X-PreRouter-Body-Bytes"] = body.Length.ToString();
@@ -773,19 +792,10 @@ public class Program
                 ctx.Response.Headers.Remove("transfer-encoding");
                 ctx.Response.Headers.Remove("content-length");
 
-                await using var responseStream = await upstream.Content.ReadAsStreamAsync(ctx.RequestAborted);
-                if (responseStream == null)
-                {
-                    ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
-                    await ctx.Response.WriteAsJsonAsync(new { error = "Failed to read upstream response stream." });
-                    return Results.Empty;
-                }
-
                 try
                 {
-                    var isStreaming = JsonFieldReader.TryReadTopLevelBool(body, "stream") ?? false;
                     var toolNames = backend.CureRawToolCalls ? RawToolCallCure.AllowedNames(forwarded) : new HashSet<string>();
-                    var cure = backend.CureRawToolCalls && toolNames.Count > 0 && upstream.IsSuccessStatusCode;
+                    var cure = !retryEnabled && backend.CureRawToolCalls && toolNames.Count > 0 && upstream.IsSuccessStatusCode;
                     if (cure && isStreaming)
                         await SseToolCallCure.PipeAsync(ForwardResponse, ctx.Response.Body, toolNames, ctx.RequestAborted,
                             count => log.LogInformation("[{RequestId}] TOOL_CALL_CURE converted {Count} raw tool calls (streaming)", requestId, count));
@@ -805,7 +815,11 @@ public class Program
 
                     async Task ForwardResponse(Stream destination)
                     {
-                        if (loopGuard.Enabled && loopGuard.WedgeEnabled && isStreaming)
+                        if (upstream.Headers.Contains("X-PreRouter-Tool-Rejected") || !upstream.IsSuccessStatusCode)
+                        {
+                            await responseStream.CopyToAsync(destination, ctx.RequestAborted);
+                        }
+                        else if (!retryEnabled && loopGuard.Enabled && loopGuard.WedgeEnabled && isStreaming)
                         {
                             // Mid-turn wedge: watch reasoning growth; on judge NUDGE, re-issue
                             // with thinking OFF + prior-reasoning context, stream to the SAME

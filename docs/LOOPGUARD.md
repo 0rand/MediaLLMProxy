@@ -3,6 +3,12 @@
 Status: draft (2026-09-01). Validated by smoke test against Qwen2.5-VL-3B on
 Force (:8008) — see "Smoke evidence" below.
 
+For corrective retries after rejected tool calls, see
+[Tool-Call Recovery](TOOL-CALL-RECOVERY.md). That guard preserves request-side
+LoopGuard nudges but bypasses the mid-turn wedge for its buffered, tool-enabled
+requests. It has its own enable switch and one shared retry budget for stack
+unavailable-tool errors and proxy raw-tool validation failures.
+
 ## Problem
 
 Models get stuck: long deliberations, reasoning loops, rehashing the same idea

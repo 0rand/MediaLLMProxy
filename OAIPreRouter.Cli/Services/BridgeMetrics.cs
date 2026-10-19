@@ -24,6 +24,9 @@ public sealed class BridgeMetrics
     private long _loopGuardAdvisorMs;
     private long _loopGuardWedges;
     private long _loopGuardWedgeMs;
+    private long _unavailableToolRetries;
+    private long _unavailableToolRetrySuccess;
+    private long _unavailableToolRetryFail;
 
     public void Scan() => Interlocked.Increment(ref _scanCount);
     public void DetourOk() => Interlocked.Increment(ref _detourOk);
@@ -44,6 +47,9 @@ public sealed class BridgeMetrics
     public void LoopGuardAdvisorMs(long ms) => Interlocked.Add(ref _loopGuardAdvisorMs, ms);
     public void LoopGuardWedge() => Interlocked.Increment(ref _loopGuardWedges);
     public void LoopGuardWedgeMs(long ms) => Interlocked.Add(ref _loopGuardWedgeMs, ms);
+    public void UnavailableToolRetry() => Interlocked.Increment(ref _unavailableToolRetries);
+    public void UnavailableToolRetrySuccess() => Interlocked.Increment(ref _unavailableToolRetrySuccess);
+    public void UnavailableToolRetryFail() => Interlocked.Increment(ref _unavailableToolRetryFail);
 
     public object Snapshot() => new
     {
@@ -65,6 +71,9 @@ public sealed class BridgeMetrics
         loop_guard_errors = Interlocked.Read(ref _loopGuardErrors),
         loop_guard_advisor_ms = Interlocked.Read(ref _loopGuardAdvisorMs),
         loop_guard_wedges = Interlocked.Read(ref _loopGuardWedges),
-        loop_guard_wedge_ms = Interlocked.Read(ref _loopGuardWedgeMs)
+        loop_guard_wedge_ms = Interlocked.Read(ref _loopGuardWedgeMs),
+        unavailable_tool_retries = Interlocked.Read(ref _unavailableToolRetries),
+        unavailable_tool_retry_success = Interlocked.Read(ref _unavailableToolRetrySuccess),
+        unavailable_tool_retry_fail = Interlocked.Read(ref _unavailableToolRetryFail)
     };
 }
