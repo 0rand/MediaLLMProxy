@@ -291,7 +291,8 @@ Everything is environment variables (`.NET` config binding) or
 | `RoutingOptions__PrimaryBackend__InjectedSystemPromptPath` | path to a file whose contents are used as the guard (wins over the inline string; read once at startup; missing file aborts startup) |
 | `RoutingOptions__PrimaryBackend__Temperature` | text sampling override — forced on every request, beats client values (null = leave client's) |
 | `RoutingOptions__PrimaryBackend__TopP` | text sampling override — forced on every request, beats client values (null = leave client's) |
-| `RoutingOptions__PrimaryBackend__CureRawToolCalls` | false (default). Convert leaked DSML/Qwen XML assistant content into standard OpenAI `tool_calls`, for streaming and non-streaming responses. Only request-declared tool names are accepted. |
+| `RoutingOptions__PrimaryBackend__ToolOutputContract` | `LegacyRaw` (default) or `StrictNative`. `StrictNative` means the backend owns tool parsing and emits native `tool_calls`. The proxy does not scan, rewrite or buffer answer content. It retries one typed guard rejection. Use `StrictNative` with the DeepSeek TensorFold stack. |
+| `RoutingOptions__PrimaryBackend__CureRawToolCalls` | false (default). **LegacyRaw only.** Convert leaked DSML/Qwen XML assistant content into standard OpenAI `tool_calls`. Ignored when `ToolOutputContract=StrictNative`. |
 | `MultimodalOptions__Enabled` | master bridge switch |
 | `MultimodalOptions__VisionBackend__BaseUrl` | primary vision detour endpoint |
 | `MultimodalOptions__DetourVision` | true (default) = detour images/video to the vision backend, text model receives an observation. **false = passthrough**: media stays RAW in the request for a natively multimodal primary (GLM-5.3, Omni); observation flow skipped, `PrimaryBackend.Temperature/TopP` still forced |
@@ -313,13 +314,15 @@ Everything is environment variables (`.NET` config binding) or
 | `LoopGuardOptions__WedgeReasoningMode` | Prior-reasoning inclusion: `summary` (default — 3B distills in the judge call) \| `verbatim` (raw, capped) \| `none` |
 | `LoopGuardOptions__WedgeBanner` | Banner prepended to the re-issued stream (visible to the user AND persisted) |
 | `LoopGuardOptions__InjectionMarker` | Marker prepended to the injected nudge (marks it as a system-side note, not a user instruction) |
-| `UnavailableToolRetryOptions__Enabled` | false (default). Retry a rejected model response once with a corrective user-turn banner. Covers stack `unavailable_tool_call` errors and proxy raw-tool rejections when curing is enabled. |
+| `UnavailableToolRetryOptions__Enabled` | false (default). Retry a rejected model response once with a corrective user-turn message. In strict mode, only a typed `source=tensorfold.tool_output_guard` rejection is retried. In legacy mode, stack `unavailable_tool_call` errors and proxy raw-tool rejections are covered. |
 | `UnavailableToolRetryOptions__MaxRetries` | Shared retry budget. Default 1, capped at 1 even if configured higher; 0 disables re-issues. |
-| `UnavailableToolRetryOptions__Banner` | Banner text appended as a new user message on the retry request (sent upstream only, never persisted client-side) |
+| `UnavailableToolRetryOptions__IncludeRequestContext` | true (default). A strict retry message includes the offered tool names and the `tool_choice`, `parallel_tool_calls` and `max_calls` constraints. It never includes rejected arguments or output. |
+| `UnavailableToolRetryOptions__StrictGuardBannerIntro` | Opening sentence for a strict guard retry message. The proxy appends the failure category, request context and retry instruction. |
+| `UnavailableToolRetryOptions__Banner` | Legacy banner text appended as a new user message on the retry request (sent upstream only, never persisted client-side) |
 | `UnavailableToolRetryOptions__InjectionMarker` | Marker prepended to the banner (marks it as a system-side retry note, not a user instruction) |
-| `UnavailableToolRetryOptions__RetryRawToolCallAborts` | true (default). Include proxy raw-tool validation failures in the shared retry policy. Requires `Enabled` and `PrimaryBackend.CureRawToolCalls`. |
-| `UnavailableToolRetryOptions__RawToolCallBanner` | Corrective banner for malformed, incomplete or disallowed raw tool calls. Requests complete valid calls using only offered tools, without repeating rejected markup. |
-| `UnavailableToolRetryOptions__MaxResponseBytes` | Maximum response bytes buffered per attempt. Default 16777216 (16 MiB). Oversized responses fail rather than triggering a model retry. |
+| `UnavailableToolRetryOptions__RetryRawToolCallAborts` | true (default). **LegacyRaw only.** Include proxy raw-tool validation failures in the shared retry policy. Ignored when `ToolOutputContract=StrictNative`. |
+| `UnavailableToolRetryOptions__RawToolCallBanner` | Legacy corrective banner for malformed, incomplete or disallowed raw tool calls. |
+| `UnavailableToolRetryOptions__MaxResponseBytes` | Maximum response bytes buffered per attempt. Default 16777216 (16 MiB). In strict mode it caps only non-streaming attempts. |
 | `MultimodalOptions__VisionBackend__ApiKey` | primary vision API token (omit for unauthenticated local inference) |
 | `MultimodalOptions__VisionModel` | primary vision model id |
 | `MultimodalOptions__VisionFallbackBackend__BaseUrl` | optional failure-only fallback vision endpoint |

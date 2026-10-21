@@ -13,7 +13,8 @@ public class BridgeMetricsTests
         var result = new Dictionary<string, long>();
         foreach (var prop in doc.RootElement.EnumerateObject())
         {
-            result[prop.Name] = prop.Value.GetInt64();
+            if (prop.Value.ValueKind == JsonValueKind.Number)
+                result[prop.Name] = prop.Value.GetInt64();
         }
         return result;
     }

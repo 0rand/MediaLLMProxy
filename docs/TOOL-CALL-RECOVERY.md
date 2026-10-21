@@ -1,17 +1,71 @@
 # Tool-Call Recovery
 
-MediaLLMProxy has two complementary tool-output features:
+MediaLLMProxy supports two tool-output contracts:
 
-- `RoutingOptions.PrimaryBackend.CureRawToolCalls` converts supported raw DSML/XML
-  assistant content into standard OpenAI `tool_calls`.
-- `UnavailableToolRetryOptions.Enabled` retries a rejected model response with a
-  corrective user message, once per incoming request.
+- `ToolOutputContract=StrictNative` is for a backend that validates tool output
+  itself. The backend emits native `tool_calls` and returns a typed terminal
+  error for rejected output. The proxy does not scan or rewrite answer content.
+- `ToolOutputContract=LegacyRaw` keeps the compatibility path that converts
+  supported raw DSML/XML assistant content into standard OpenAI `tool_calls`.
 
-Both are disabled in the checked-in defaults. The opt-in example is
-[`examples/appsettings.tool-recovery.json`](../examples/appsettings.tool-recovery.json).
-It uses loopback port 7071; it does not bind production port 8000.
+Both contracts can retry a rejected model response once with a corrective user
+message. The strict path retries only the backend's typed guard rejection. The
+legacy path also covers proxy raw-tool validation failures when curing is
+enabled.
+
+The strict contract is the correct choice for the local DeepSeek TensorFold
+stack at `:8100`. The legacy raw-cure path is for older backends that do not
+produce native calls.
+
+## Strict-native contract
+
+Set `RoutingOptions.PrimaryBackend.ToolOutputContract` to `StrictNative`:
+
+```json
+{
+  "RoutingOptions": {
+    "PrimaryBackend": {
+      "BaseUrl": "http://127.0.0.1:8100",
+      "ToolOutputContract": "StrictNative",
+      "CureRawToolCalls": false
+    }
+  },
+  "UnavailableToolRetryOptions": {
+    "Enabled": true,
+    "MaxRetries": 1,
+    "IncludeRequestContext": true,
+    "MaxResponseBytes": 16777216
+  }
+}
+```
+
+In strict-native mode:
+
+- `CureRawToolCalls` is ignored. A startup warning records the conflict.
+  The proxy never calls `SseToolCallCure` or `RawToolCallCure`.
+- Native `tool_calls`, prose and reasoning pass through unchanged. The proxy
+  does not buffer answer content for validation.
+- A retry is allowed only for a terminal `model_output_error` with
+  `code=unavailable_tool_call` and
+  `source=tensorfold.tool_output_guard`. Other errors pass through.
+- The retry appends one `role: user` message. It includes the offered tool
+  names, the request `tool_choice`, `parallel_tool_calls` and `max_calls`
+  constraints, and a request to emit one complete call with schema-valid JSON.
+- The message never includes rejected arguments, rejected prose or raw model
+  output. The backend's payload-free `rejection_id` is logged, not sent to the
+  model.
+- Tools, `tool_choice`, thinking settings and sampling are preserved. The
+  marker message is sent upstream only and is not persisted client-side.
+
+Streaming limit: the proxy inspects only the initial SSE preamble. It retries
+when the guard error arrives before any client-visible frame. The strict stack
+normally rejects at the end of generation, after reasoning or prose has
+streamed. The proxy then forwards the error and does not replay. Use
+non-streaming tool turns when a corrective retry is required.
 
 ## Configuration
+
+The legacy raw-cure example is below. It is not for a strict-native backend.
 
 ```json
 {
@@ -47,20 +101,32 @@ requires deploying an updated binary before restarting. See
 
 ## Recovery Contract
 
-The stack's `model_output_error` / `unavailable_tool_call` error triggers recovery
-for HTTP JSON and for an SSE error frame that is received before any SSE frame is
-forwarded. With curing enabled, non-streaming proxy raw-tool validation failures
-also trigger recovery when `RetryRawToolCallAborts` is true. These include
-malformed/incomplete markup and raw calls that name an undeclared tool.
+In strict-native mode, recovery is allowed only for a terminal
+`model_output_error` with `code=unavailable_tool_call`,
+`source=tensorfold.tool_output_guard` and a model-correctable reason. The proxy
+re-issues the request once. Transport failures, authentication failures,
+unrelated 5xx responses, cancellation and `stream_prefix_changed` are not
+retried.
+
+In legacy mode, the stack's `model_output_error` / `unavailable_tool_call` error
+also triggers recovery for HTTP JSON and for an SSE error frame received before
+any SSE frame is forwarded. With curing enabled, non-streaming proxy raw-tool
+validation failures also trigger recovery when `RetryRawToolCallAborts` is true.
 
 The retry starts from the final forwarded request after sampling, media rewrites
 and request-side LoopGuard evaluation. It appends exactly one new `role: user`
 message. Failed assistant output and generated arguments are not included.
 
-`InjectionMarker` prefixes the corrective message. `Banner` controls the message
-for an unavailable tool; `RawToolCallBanner` controls the message for a raw-tool
-rejection. The defaults ask the model to use only offered tools and, for raw-tool
-failures, emit complete valid calls without repeating rejected protocol markup.
+In strict-native mode, `StrictGuardBannerIntro` opens the message. The proxy
+appends a category-specific sentence when the backend supplies a safe
+`category`, then the offered tool names and the request `tool_choice`,
+`parallel_tool_calls` and `max_calls` constraints. Set
+`IncludeRequestContext=false` to omit the request context. The message never
+contains rejected arguments or output.
+
+In legacy mode, `InjectionMarker` prefixes the corrective message. `Banner`
+controls the message for an unavailable tool; `RawToolCallBanner` controls the
+message for a raw-tool rejection.
 
 Thinking mode, sampling, tool definitions and `tool_choice` are preserved. The
 proxy neither executes calls nor invents arguments or tool names. The banner is
@@ -104,14 +170,22 @@ retry feature only controls whether an eligible non-streaming response is reissu
 
 ## Streaming Tradeoffs
 
-Non-streaming eligible attempts are fully buffered and validated. Streaming
-attempts inspect only their first SSE line: an upfront unavailable-tool error may
-be retried, but after a comment, heartbeat, reasoning, `reasoning_content`, or
-other SSE frame is forwarded the proxy never replays the request. This prevents
-duplicate or divergent visible reasoning. `MaxResponseBytes` caps only buffered
+In strict-native mode the proxy does not buffer answer content. It reads only
+the initial SSE preamble to decide whether a retry is safe. If the first
+client-visible frame arrives before a guard error, the proxy forwards the
+stream unchanged and does not replay it. This prevents duplicate reasoning or
+prose. A guard error that arrives before any visible frame, including after
+comments or heartbeats, can be retried. `MaxResponseBytes` caps only
 non-streaming attempts.
 
-The streaming raw-call filter forwards SSE comments, heartbeats, errors,
+In legacy mode, non-streaming eligible attempts are fully buffered and
+validated. Streaming attempts inspect only their first SSE line: an upfront
+unavailable-tool error may be retried, but after a comment, heartbeat, reasoning,
+`reasoning_content`, or other SSE frame is forwarded the proxy never replays the
+request. This prevents duplicate or divergent visible reasoning.
+`MaxResponseBytes` caps only buffered non-streaming attempts.
+
+The legacy streaming raw-call filter forwards SSE comments, heartbeats, errors,
 `reasoning`, and `reasoning_content` immediately. It buffers answer `content` per
 choice until its terminal event so raw calls remain atomic and literal context can
 span arbitrary chunks. A malformed actual raw call after visible output ends with
@@ -121,11 +195,11 @@ is not finalized as a retry-success metric after its first forwarded frame.
 Request-side LoopGuard still runs, but the mid-turn wedge is bypassed for recovery
 requests. Media observations are appended to successful responses only.
 
-Raw-markup recognition remains a compatibility heuristic, not a security boundary
-or complete tool-argument schema validation. Fenced/inline code, quoted text and
-Markdown blockquotes are preserved as literal protocol examples. Recovery helps
+Raw-markup recognition in legacy mode remains a compatibility heuristic, not a
+security boundary or complete tool-argument schema validation. Recovery helps
 the model correct the response; it does not replace authoritative tool validation
-in the serving stack or client.
+in the serving stack or client. The strict-native contract exists because a
+second parser can disagree with the backend's literal and envelope rules.
 
 ## Health And Logs
 
@@ -141,12 +215,15 @@ are in two separate places:
 ```json
 {
   "primary": {
-    "cureRawToolCalls": true
+    "toolOutputContract": "StrictNative",
+    "cureRawToolCalls": false
   },
   "unavailableToolRetry": {
     "enabled": true,
     "maxRetries": 1,
-    "retryRawToolCallAborts": true,
+    "retryRawToolCallAborts": false,
+    "strictGuardOnly": true,
+    "includeRequestContext": true,
     "maxResponseBytes": 16777216
   }
 }
@@ -154,15 +231,19 @@ are in two separate places:
 
 `unavailableToolRetry` is a **top-level** object, not a field inside `primary` or
 `loopGuard`. Its `metrics` object contains `unavailable_tool_retries`,
-`unavailable_tool_retry_success` and `unavailable_tool_retry_fail`. These counters
-cover both rejection types and reset when the process restarts. A zero retry
-count means no corrective re-issue has happened since restart, not that the
-feature is disabled.
+`unavailable_tool_retry_success`, `unavailable_tool_retry_fail`,
+`tool_retry_skipped_visible`, `tool_retry_skipped_not_guard` and
+`tool_retry_fail_by_category`. These counters reset when the process restarts.
+A zero retry count means no corrective re-issue has happened since restart, not
+that the feature is disabled.
 
-Startup logs include `UnavailableToolRetry: enabled=True maxRetries=1 rawToolAborts=True`.
-Actual retries are logged as `TOOL_RETRY reason=unavailable_tool_call` or
-`TOOL_RETRY reason=invalid_raw_tool_call`, without rejected arguments.
-`X-PreRouter-Tool-Retries` reports re-issues for eligible requests;
+Startup logs include `UnavailableToolRetry: enabled=True maxRetries=1 rawToolAborts=False strictGuardOnly=True`.
+Strict retries are logged as
+`TOOL_RETRY reason=strict_guard_rejection category=... rejection_id=...`.
+Legacy retries are logged as `TOOL_RETRY reason=unavailable_tool_call` or
+`TOOL_RETRY reason=invalid_raw_tool_call`. Rejected arguments are not logged.
+`X-PreRouter-Tool-Contract` reports `strict-native` or `legacy-raw`.
+`X-PreRouter-Tool-Retries` reports re-issues for eligible requests.
 `X-PreRouter-Tool-Rejected` identifies a final rejection.
 
 If the health object is missing, verify the deployed build and endpoint first.

@@ -1,5 +1,6 @@
 namespace OAIPreRouter.Cli.Services;
 
+using System.Collections.Concurrent;
 using System.Threading;
 
 /// <summary>In-memory bridge counters (no external deps). Interlocked for thread safety.</summary>
@@ -26,7 +27,9 @@ public sealed class BridgeMetrics
     private long _loopGuardWedgeMs;
     private long _unavailableToolRetries;
     private long _unavailableToolRetrySuccess;
-    private long _unavailableToolRetryFail;
+    private long _toolRetrySkippedVisible;
+    private long _toolRetrySkippedNotGuard;
+    private readonly ConcurrentDictionary<string, long> _toolRetryFailByCategory = new();
 
     public void Scan() => Interlocked.Increment(ref _scanCount);
     public void DetourOk() => Interlocked.Increment(ref _detourOk);
@@ -49,7 +52,14 @@ public sealed class BridgeMetrics
     public void LoopGuardWedgeMs(long ms) => Interlocked.Add(ref _loopGuardWedgeMs, ms);
     public void UnavailableToolRetry() => Interlocked.Increment(ref _unavailableToolRetries);
     public void UnavailableToolRetrySuccess() => Interlocked.Increment(ref _unavailableToolRetrySuccess);
-    public void UnavailableToolRetryFail() => Interlocked.Increment(ref _unavailableToolRetryFail);
+    public void UnavailableToolRetryFail() => ToolRetryFail("unclassified");
+    public void ToolRetryFail(string category) =>
+        _toolRetryFailByCategory.AddOrUpdate(
+            string.IsNullOrWhiteSpace(category) ? "unclassified" : category,
+            1,
+            (_, value) => value + 1);
+    public void ToolRetrySkippedVisible() => Interlocked.Increment(ref _toolRetrySkippedVisible);
+    public void ToolRetrySkippedNotGuard() => Interlocked.Increment(ref _toolRetrySkippedNotGuard);
 
     public object Snapshot() => new
     {
@@ -74,6 +84,9 @@ public sealed class BridgeMetrics
         loop_guard_wedge_ms = Interlocked.Read(ref _loopGuardWedgeMs),
         unavailable_tool_retries = Interlocked.Read(ref _unavailableToolRetries),
         unavailable_tool_retry_success = Interlocked.Read(ref _unavailableToolRetrySuccess),
-        unavailable_tool_retry_fail = Interlocked.Read(ref _unavailableToolRetryFail)
+        unavailable_tool_retry_fail = _toolRetryFailByCategory.Values.Sum(),
+        tool_retry_skipped_visible = Interlocked.Read(ref _toolRetrySkippedVisible),
+        tool_retry_skipped_not_guard = Interlocked.Read(ref _toolRetrySkippedNotGuard),
+        tool_retry_fail_by_category = _toolRetryFailByCategory.ToDictionary(pair => pair.Key, pair => pair.Value)
     };
 }
