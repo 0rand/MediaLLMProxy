@@ -464,7 +464,7 @@ public static class UnavailableToolRetryService
             "parallel_calls_disabled" => "The previous response emitted more than one tool call, but parallel calls are disabled.",
             "tool_choice_disallowed" => "The previous call did not respect the request tool_choice.",
             "required_tool_missing" => "The previous response did not include the required tool call.",
-            _ => "The previous tool output was rejected by the strict validator."
+            _ => ""
         };
 
     private static string? NormalizeCategory(string? category)
