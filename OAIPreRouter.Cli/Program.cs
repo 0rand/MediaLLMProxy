@@ -60,6 +60,10 @@ public class Program
         var injectedSystemPrompt = options.PrimaryBackend.GetEffectiveInjectedPrompt();
         var limiter = app.Services.GetRequiredService<ConnectionLimiter>();
         var log = app.Logger;
+        var strictNative = options.PrimaryBackend.ToolOutputContract == ToolOutputContract.StrictNative;
+        var effectiveCureRawToolCalls = !strictNative && options.PrimaryBackend.CureRawToolCalls;
+        if (strictNative && options.PrimaryBackend.CureRawToolCalls)
+            log.LogWarning("CureRawToolCalls is ignored because PrimaryBackend.ToolOutputContract=StrictNative");
         var multimodal = app.Services.GetRequiredService<IOptions<MultimodalOptions>>().Value;
         var loopGuard = app.Services.GetRequiredService<IOptions<LoopGuardOptions>>().Value;
         var structuredOutput = app.Services.GetRequiredService<IOptions<StructuredOutputOptions>>().Value;
@@ -71,7 +75,8 @@ public class Program
 
         log.LogInformation("OAIPreRouter starting — PHASE 1: observation mode (all requests → primary)");
         log.LogInformation("PrimaryBackend: {Url}", options.PrimaryBackend.BaseUrl);
-        log.LogInformation("Raw tool-call curing: enabled={Enabled}", options.PrimaryBackend.CureRawToolCalls);
+        log.LogInformation("ToolOutputContract: {Contract}", options.PrimaryBackend.ToolOutputContract);
+        log.LogInformation("Raw tool-call curing: enabled={Enabled}", effectiveCureRawToolCalls);
         log.LogInformation("FastBackend: {Url} (disabled in phase 1)", options.FastBackend.BaseUrl);
         log.LogInformation("HeavyBackend: {Url} (disabled in phase 1)", options.HeavyBackend.BaseUrl);
         log.LogInformation("SystemPromptThresholdBytes: {Threshold}", options.SystemPromptThresholdBytes);
@@ -122,8 +127,9 @@ public class Program
             structuredOutput.DisableThinkingForResponseFormat);
         log.LogInformation("Sampling override: temperature={Temperature} top_p={TopP} (null = pass-through, caller sampling wins)",
             options.PrimaryBackend.Temperature, options.PrimaryBackend.TopP);
-        log.LogInformation("UnavailableToolRetry: enabled={Enabled} maxRetries={MaxRetries} rawToolAborts={RawToolAborts}",
-            unavailableToolRetry.Enabled, Math.Clamp(unavailableToolRetry.MaxRetries, 0, 1), unavailableToolRetry.RetryRawToolCallAborts);
+        log.LogInformation("UnavailableToolRetry: enabled={Enabled} maxRetries={MaxRetries} rawToolAborts={RawToolAborts} strictGuardOnly={StrictGuardOnly}",
+            unavailableToolRetry.Enabled, Math.Clamp(unavailableToolRetry.MaxRetries, 0, 1),
+            !strictNative && unavailableToolRetry.RetryRawToolCallAborts, strictNative);
 
         app.MapPost("v1/chat/completions", HandleChatCompletion);
         app.MapPost("chat/completions", HandleChatCompletion);
@@ -139,7 +145,8 @@ public class Program
                     url = options.PrimaryBackend.BaseUrl,
                     temperature = (double?)options.PrimaryBackend.Temperature,
                     topP = (double?)options.PrimaryBackend.TopP,
-                    cureRawToolCalls = options.PrimaryBackend.CureRawToolCalls,
+                    toolOutputContract = options.PrimaryBackend.ToolOutputContract.ToString(),
+                    cureRawToolCalls = effectiveCureRawToolCalls,
                     sampling = (object?)new
                     {
                         temperature = options.PrimaryBackend.Temperature,
@@ -156,7 +163,16 @@ public class Program
                     : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)null },
                 loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)loopGuard.AdvisorBackend.BaseUrl, model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() },
                 structuredOutput = new { disableThinkingForResponseFormat = structuredOutput.DisableThinkingForResponseFormat },
-                unavailableToolRetry = new { enabled = unavailableToolRetry.Enabled, maxRetries = Math.Clamp(unavailableToolRetry.MaxRetries, 0, 1), retryRawToolCallAborts = unavailableToolRetry.RetryRawToolCallAborts, maxResponseBytes = unavailableToolRetry.MaxResponseBytes, metrics = (object?)metrics.Snapshot() }
+                unavailableToolRetry = new
+                {
+                    enabled = unavailableToolRetry.Enabled,
+                    maxRetries = Math.Clamp(unavailableToolRetry.MaxRetries, 0, 1),
+                    retryRawToolCallAborts = !strictNative && unavailableToolRetry.RetryRawToolCallAborts,
+                    strictGuardOnly = strictNative,
+                    includeRequestContext = unavailableToolRetry.IncludeRequestContext,
+                    maxResponseBytes = unavailableToolRetry.MaxResponseBytes,
+                    metrics = (object?)metrics.Snapshot()
+                }
             });
         });
 
@@ -253,6 +269,8 @@ public class Program
 
             // Phase 1: always route to primary
             var backend = opts.PrimaryBackend;
+            var backendStrictNative = backend.ToolOutputContract == ToolOutputContract.StrictNative;
+            var backendCureRawToolCalls = !backendStrictNative && backend.CureRawToolCalls;
 
             // === Model enforcement: rewrite the request model to the configured main model ===
             if (!string.IsNullOrWhiteSpace(backend.RewriteModel))
@@ -784,8 +802,9 @@ public class Program
                         request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
                         CopyHeaders(ctx, request, backend);
                         return await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
-                    }, forwarded, isStreaming, backend.CureRawToolCalls, unavailableToolRetry, metrics, ctx.RequestAborted,
-                    code => log.LogInformation("[{RequestId}] TOOL_RETRY reason={Code}; refiring once with corrective user banner", requestId, code));
+                    }, forwarded, isStreaming, backendCureRawToolCalls, unavailableToolRetry, metrics, ctx.RequestAborted,
+                    code => log.LogInformation("[{RequestId}] TOOL_RETRY reason={Code}; refiring once with corrective user banner", requestId, code),
+                    contract: backend.ToolOutputContract);
                 sw.Stop();
 
                 log.LogInformation(
@@ -806,6 +825,7 @@ public class Program
                 ctx.Response.Headers["X-PreRouter-Detect"] = detectionType;
                 ctx.Response.Headers["X-PreRouter-Intended-Lane"] = intendedLane;
                 ctx.Response.Headers["X-PreRouter-Body-Bytes"] = body.Length.ToString();
+                ctx.Response.Headers["X-PreRouter-Tool-Contract"] = backendStrictNative ? "strict-native" : "legacy-raw";
                 if (forwardBody != null)
                     ctx.Response.Headers["X-PreRouter-Media"] = string.Join(",", mediaKinds);
                 if (loopGuardVerdict != null)
@@ -824,8 +844,8 @@ public class Program
 
                 try
                 {
-                    var toolNames = backend.CureRawToolCalls ? RawToolCallCure.AllowedNames(forwarded) : new HashSet<string>();
-                    var cure = backend.CureRawToolCalls && toolNames.Count > 0 && upstream.IsSuccessStatusCode;
+                    var toolNames = backendCureRawToolCalls ? RawToolCallCure.AllowedNames(forwarded) : new HashSet<string>();
+                    var cure = backendCureRawToolCalls && toolNames.Count > 0 && upstream.IsSuccessStatusCode;
                     if (cure && isStreaming)
                         await SseToolCallCure.PipeAsync(ForwardResponse, ctx.Response.Body, toolNames, ctx.RequestAborted,
                             count => log.LogInformation("[{RequestId}] TOOL_CALL_CURE converted {Count} raw tool calls (streaming)", requestId, count));
@@ -902,7 +922,7 @@ public class Program
                 catch (Exception streamEx) when (!streamEx.IsOperationCanceled())
                 {
                     log.LogError(streamEx, "[{RequestId}] STREAM_ERROR elapsedMs={ElapsedMs}", requestId, sw.ElapsedMilliseconds);
-                    if (options.PrimaryBackend.CureRawToolCalls)
+                    if (backendCureRawToolCalls)
                         ctx.Abort(); // Do not turn an invalid/truncated tool call into a successful completion.
                 }
             }

@@ -92,12 +92,14 @@ file is the right home for stable, non-secret defaults (e.g. vision model id).
 | `RoutingOptions__PrimaryBackend__InjectedSystemPromptPath` | guard prompt from a file (wins over inline; missing file aborts startup) |
 | `RoutingOptions__PrimaryBackend__Temperature` | text sampling override — forced on every request, beats client values (null = leave client's) |
 | `RoutingOptions__PrimaryBackend__TopP` | text sampling override — forced on every request, beats client values (null = leave client's) |
-| `RoutingOptions__PrimaryBackend__CureRawToolCalls` | false by default; convert supported raw DSML/XML content to standard `tool_calls` |
-| `UnavailableToolRetryOptions__Enabled` | false by default; recover once from rejected tool calls with a corrective user-message banner |
-| `UnavailableToolRetryOptions__MaxRetries` | shared retry budget across both rejection types; defaults to 1 and is capped at 1 |
-| `UnavailableToolRetryOptions__RetryRawToolCallAborts` | true by default; include proxy raw-tool rejections when recovery and curing are enabled |
-| `UnavailableToolRetryOptions__MaxResponseBytes` | response buffer limit per eligible attempt, default 16777216 bytes (16 MiB) |
-| `UnavailableToolRetryOptions__Banner` / `RawToolCallBanner` | corrective text for unavailable tools / rejected raw markup |
+| `RoutingOptions__PrimaryBackend__ToolOutputContract` | `LegacyRaw` (default) or `StrictNative`. `StrictNative` means the backend owns tool parsing and emits native `tool_calls`. The proxy does not scan or rewrite content and retries one typed guard rejection. |
+| `RoutingOptions__PrimaryBackend__CureRawToolCalls` | false by default; **LegacyRaw only**. Convert supported raw DSML/XML content to standard `tool_calls`. Ignored when `ToolOutputContract=StrictNative`. |
+| `UnavailableToolRetryOptions__Enabled` | false by default; recover once from a rejected tool call with a corrective user message |
+| `UnavailableToolRetryOptions__MaxRetries` | shared retry budget; defaults to 1 and is capped at 1 |
+| `UnavailableToolRetryOptions__RetryRawToolCallAborts` | true by default; **LegacyRaw only**. Include proxy raw-tool rejections when recovery and curing are enabled. |
+| `UnavailableToolRetryOptions__IncludeRequestContext` | true by default; strict retry messages include offered tool names and request constraints |
+| `UnavailableToolRetryOptions__MaxResponseBytes` | response buffer limit per non-streaming attempt, default 16777216 bytes (16 MiB) |
+| `UnavailableToolRetryOptions__Banner` / `RawToolCallBanner` | legacy corrective text for unavailable tools / rejected raw markup |
 | `RoutingOptions__VerboseRequests` | log incoming bodies (debug) |
 | `RoutingOptions__VerboseRewrites` | log the rewritten body actually sent to the text model |
 | `MultimodalOptions__Enabled` | master bridge switch (true to bridge images) |

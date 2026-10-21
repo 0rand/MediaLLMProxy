@@ -86,4 +86,12 @@ public record BackendConfig
 
     /// <summary>Convert leaked DSML/Qwen XML content into tool_calls for tools declared by the request.</summary>
     public bool CureRawToolCalls { get; init; } = false;
+
+    /// <summary>
+    /// Gets the tool-output contract for this backend. <see cref="ToolOutputContract.StrictNative"/>
+    /// disables all raw-tool scanning and answer-content buffering. The backend owns
+    /// executable tool parsing and returns native tool calls or a typed terminal error.
+    /// <see cref="ToolOutputContract.LegacyRaw"/> keeps the compatibility cure path.
+    /// </summary>
+    public ToolOutputContract ToolOutputContract { get; init; } = ToolOutputContract.LegacyRaw;
 }
