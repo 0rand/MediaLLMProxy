@@ -126,6 +126,28 @@ public class StrictToolRetryTests
     }
 
     [Fact]
+    public async Task StrictBannerWithoutCategoryUsesRequestContextOnly()
+    {
+        var noCategory = JsonNode.Parse(StrictError)!.AsObject();
+        noCategory["error"]!.AsObject().Remove("category");
+        var error = noCategory.ToJsonString();
+        var sent = new List<string>();
+        using var result = await Send((body, _) =>
+        {
+            sent.Add(body);
+            return sent.Count == 1
+                ? Reply(error, false, HttpStatusCode.InternalServerError)
+                : Reply(Completion("ok"), false);
+        });
+
+        Assert.Equal(2, sent.Count);
+        var banner = JsonNode.Parse(sent[1])!["messages"]![1]!["content"]!.GetValue<string>();
+        Assert.Contains(Options.StrictGuardBannerIntro, banner);
+        Assert.Contains("Use only these offered functions", banner);
+        Assert.DoesNotContain("rejected by the strict validator", banner);
+    }
+
+    [Fact]
     public async Task StrictStreamingRejectionBeforeVisibleFrameRetries()
     {
         var first = ": heartbeat\n\ndata: " + StrictErrorLine + "\n\ndata: [DONE]\n\n";
