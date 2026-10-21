@@ -97,7 +97,7 @@ file is the right home for stable, non-secret defaults (e.g. vision model id).
 | `UnavailableToolRetryOptions__Enabled` | false by default; recover once from a rejected tool call with a corrective user message |
 | `UnavailableToolRetryOptions__MaxRetries` | shared retry budget; defaults to 1 and is capped at 1 |
 | `UnavailableToolRetryOptions__RetryRawToolCallAborts` | true by default; **LegacyRaw only**. Include proxy raw-tool rejections when recovery and curing are enabled. |
-| `UnavailableToolRetryOptions__IncludeRequestContext` | true by default; strict retry messages include offered tool names and request constraints |
+| `UnavailableToolRetryOptions__IncludeRequestContext` | true by default; strict retry messages include normalized offered-tool policy. `max_calls` is not included because the pinned backend ignores that wire field. |
 | `UnavailableToolRetryOptions__MaxResponseBytes` | response buffer limit per non-streaming attempt, default 16777216 bytes (16 MiB) |
 | `UnavailableToolRetryOptions__Banner` / `RawToolCallBanner` | legacy corrective text for unavailable tools / rejected raw markup |
 | `RoutingOptions__VerboseRequests` | log incoming bodies (debug) |

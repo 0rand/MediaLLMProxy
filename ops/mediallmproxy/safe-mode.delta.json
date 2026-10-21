@@ -1,0 +1,14 @@
+{
+  "RoutingOptions": {
+    "PrimaryBackend": {
+      "ToolOutputContract": "StrictNative",
+      "CureRawToolCalls": false
+    }
+  },
+  "LoopGuardOptions": {
+    "WedgeEnabled": false
+  },
+  "UnavailableToolRetryOptions": {
+    "Enabled": false
+  }
+}

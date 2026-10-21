@@ -25,9 +25,11 @@ public record UnavailableToolRetryOptions
     /// <summary>Maximum bytes buffered per attempt before any output reaches the client.</summary>
     public long MaxResponseBytes { get; init; } = 16 * 1024 * 1024;
 
-    /// <summary>When true, a strict guard retry includes the offered tool names and
-    /// the request tool-choice and parallel-call constraints. It never includes
-    /// rejected arguments, rejected prose or raw model output.</summary>
+    /// <summary>When true, a strict guard retry includes offered function names and
+    /// normalized tool-choice/parallel-call guidance. Omitted, null and auto choices
+    /// remain optional; false parallelism means at most one call. Wire max_calls is
+    /// intentionally excluded because the pinned backend ignores it. The banner never
+    /// includes rejected arguments, rejected prose or raw model output.</summary>
     public bool IncludeRequestContext { get; init; } = true;
 
     /// <summary>Opening sentence for a strict guard rejection banner. The builder

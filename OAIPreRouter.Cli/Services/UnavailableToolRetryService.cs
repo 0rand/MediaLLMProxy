@@ -253,46 +253,49 @@ public static class UnavailableToolRetryService
     {
         var sb = new StringBuilder((opts.StrictGuardBannerIntro ?? "").Trim());
         AppendSentence(sb, CategoryDetail(rejection.Category));
-        if (opts.IncludeRequestContext)
-            AppendSentence(sb, BuildStrictRequestContext(body));
-        if (RequestForbidsTools(body))
+        var policy = NormalizeStrictRequestPolicy(body);
+        if (opts.IncludeRequestContext && policy.IsValid)
+            AppendSentence(sb, BuildStrictRequestContext(policy));
+        if (policy.Choice == StrictToolChoice.None)
         {
-            AppendSentence(sb, "Do not emit any tool call or protocol markup.");
+            AppendSentence(sb, "Do not emit an executable tool call. Preserve any requested inert tool or protocol examples as text.");
+        }
+        else if (policy.Choice == StrictToolChoice.Required)
+        {
+            AppendSentence(sb, "Emit at least one complete call to an offered function with JSON arguments that match its schema.");
+            AppendSentence(sb, "Do not emit partial, truncated, or malformed calls. Do not repeat the rejected markup.");
+        }
+        else if (policy.Choice == StrictToolChoice.Named)
+        {
+            AppendSentence(sb, "Use the exact required function and JSON arguments that match its offered schema.");
+            AppendSentence(sb, "Do not emit partial, truncated, or malformed calls. Do not repeat the rejected markup.");
         }
         else
         {
-            AppendSentence(sb, "Emit a complete tool call with JSON arguments that match the function schema.");
-            AppendSentence(sb, "Do not emit partial, truncated, or malformed calls. Do not repeat the rejected markup.");
+            AppendSentence(sb, "Calls remain optional. Follow the original task. If a call is needed, use only an offered function with valid JSON arguments.");
+            AppendSentence(sb, "Do not emit partial, truncated, or malformed executable calls. Preserve requested literal or inert protocol examples as text.");
         }
         AppendSentence(sb, "Retry the original task now.");
         return sb.ToString();
     }
 
-    private static bool RequestForbidsTools(string body)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            return doc.RootElement.ValueKind == JsonValueKind.Object &&
-                   doc.RootElement.TryGetProperty("tool_choice", out var choice) &&
-                   choice.ValueKind == JsonValueKind.String &&
-                   string.Equals(choice.GetString(), "none", StringComparison.Ordinal);
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-    }
-
     /// <summary>Build the retry body for a strict guard rejection.</summary>
-    public static string? BuildStrictGuardRetryBody(string body, UnavailableToolRetryOptions opts, ToolGuardRejection rejection) =>
-        JsonBodyRewriter.TryAppendUserMessage(body, opts.InjectionMarker ?? "", BuildStrictGuardBanner(body, opts, rejection));
+    public static string? BuildStrictGuardRetryBody(string body, UnavailableToolRetryOptions opts, ToolGuardRejection rejection)
+    {
+        var policy = NormalizeStrictRequestPolicy(body);
+        return policy.IsValid
+            ? JsonBodyRewriter.TryAppendUserMessage(body, opts.InjectionMarker ?? "", BuildStrictGuardBanner(body, opts, rejection))
+            : null;
+    }
 
     private static async Task<HttpResponseMessage> SendStrictAsync(
         Func<string, CancellationToken, Task<HttpResponseMessage>> send, string body, bool streaming,
         UnavailableToolRetryOptions opts, BridgeMetrics metrics, CancellationToken ct, Action<string>? onRetry)
     {
-        var eligible = opts.Enabled && HasDeclaredTools(body);
+        var policy = NormalizeStrictRequestPolicy(body);
+        // Invalid or contradictory client policy belongs to the backend. Never retry a
+        // guard response by silently replacing it with a proxy interpretation.
+        var eligible = opts.Enabled && HasDeclaredTools(body) && policy.IsValid;
         var maxRetries = Math.Clamp(opts.MaxRetries, 0, 1);
         var request = body;
         for (var attempt = 0; ; attempt++)
@@ -407,42 +410,61 @@ public static class UnavailableToolRetryService
 
     private static async Task<SsePreamble> ReadPreambleAsync(Stream stream, CancellationToken ct)
     {
+        // BufferedStream avoids issuing one upstream read per byte while retaining any
+        // read-ahead bytes for PrefixStream when this preamble is forwarded.
+        var input = new BufferedStream(stream, 4096);
         using var prefix = new MemoryStream();
+        var eventData = new List<string>();
         while (true)
         {
-            if (prefix.Length > MaxPreambleBytes)
-                return new SsePreamble(prefix.ToArray(), stream, Visible: true, GuardRejection: null, ErrorFrame: false);
-            var (text, bytes) = await ReadLineAsync(stream, ct);
-            if (bytes.Length == 0)
-                return new SsePreamble(prefix.ToArray(), stream, Visible: false, GuardRejection: null, ErrorFrame: false);
-            prefix.Write(bytes);
-            var line = text.TrimEnd('\r');
-            if (line.Length == 0 || line.StartsWith(":", StringComparison.Ordinal)) continue;
-            if (line.StartsWith("event:", StringComparison.Ordinal) ||
-                line.StartsWith("id:", StringComparison.Ordinal) ||
-                line.StartsWith("retry:", StringComparison.Ordinal)) continue;
-            if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
-            var payload = line[5..].Trim();
-            if (payload.Length == 0) continue;
-            if (payload == "[DONE]")
-                return new SsePreamble(prefix.ToArray(), stream, Visible: true, GuardRejection: null, ErrorFrame: false);
-            if (TryParseGuardRejection(payload, out var rejection))
-                return new SsePreamble(prefix.ToArray(), stream, Visible: false, rejection, ErrorFrame: true);
-            return new SsePreamble(prefix.ToArray(), stream, Visible: true, GuardRejection: null, ErrorFrame: IsErrorJson(payload));
+            var remaining = MaxPreambleBytes - prefix.Length;
+            if (remaining <= 0)
+                return new SsePreamble(prefix.ToArray(), input, Visible: true, GuardRejection: null, ErrorFrame: false);
+            var line = await ReadLineAsync(input, remaining, ct);
+            if (line.Bytes.Length == 0)
+                return new SsePreamble(prefix.ToArray(), input, Visible: false, GuardRejection: null, ErrorFrame: false);
+            prefix.Write(line.Bytes);
+            // A capped or EOF-terminated line is not a complete SSE event. Forward it
+            // unchanged rather than retrying from a potentially truncated preamble.
+            if (!line.Terminated)
+                return new SsePreamble(prefix.ToArray(), input, Visible: true, GuardRejection: null, ErrorFrame: false);
+
+            var lineText = line.Text;
+            var sseLine = lineText.TrimEnd('\r', '\n');
+            if (sseLine.Length == 0)
+            {
+                if (eventData.Count == 0) continue;
+                var payload = string.Join("\n", eventData);
+                if (payload == "[DONE]")
+                    return new SsePreamble(prefix.ToArray(), input, Visible: true, GuardRejection: null, ErrorFrame: false);
+                if (TryParseGuardRejection(payload, out var rejection))
+                    return new SsePreamble(prefix.ToArray(), input, Visible: false, rejection, ErrorFrame: true);
+                return new SsePreamble(prefix.ToArray(), input, Visible: true, GuardRejection: null, ErrorFrame: IsErrorJson(payload));
+            }
+            if (sseLine.StartsWith(":", StringComparison.Ordinal)) continue;
+            if (sseLine.StartsWith("event:", StringComparison.Ordinal) ||
+                sseLine.StartsWith("id:", StringComparison.Ordinal) ||
+                sseLine.StartsWith("retry:", StringComparison.Ordinal)) continue;
+            if (!sseLine.StartsWith("data:", StringComparison.Ordinal)) continue;
+            eventData.Add(sseLine[5..].Trim());
         }
     }
 
-    private static async Task<(string Text, byte[] Bytes)> ReadLineAsync(Stream stream, CancellationToken ct)
+    private static async Task<(string Text, byte[] Bytes, bool Terminated)> ReadLineAsync(Stream stream, long maxBytes, CancellationToken ct)
     {
         using var bytes = new MemoryStream();
         var one = new byte[1];
-        while (await stream.ReadAsync(one.AsMemory(), ct) is var read && read > 0)
+        while (bytes.Length < maxBytes && await stream.ReadAsync(one.AsMemory(), ct) is var read && read > 0)
         {
             bytes.WriteByte(one[0]);
-            if (one[0] == (byte)'\n') break;
+            if (one[0] == (byte)'\n')
+            {
+                var terminated = bytes.ToArray();
+                return (Encoding.UTF8.GetString(terminated), terminated, true);
+            }
         }
         var data = bytes.ToArray();
-        return (Encoding.UTF8.GetString(data), data);
+        return (Encoding.UTF8.GetString(data), data, false);
     }
 
     private static string DescribeRetry(ToolGuardRejection rejection) =>
@@ -492,54 +514,107 @@ public static class UnavailableToolRetryService
         sb.Append(text.Trim());
     }
 
-    private static string BuildStrictRequestContext(string body)
+    private enum StrictToolChoice { Optional, None, Required, Named }
+
+    private sealed record StrictRequestPolicy(
+        bool IsValid,
+        StrictToolChoice Choice,
+        string? NamedFunction,
+        bool ParallelCallsDisabled,
+        IReadOnlyList<string> OfferedFunctions);
+
+    private static StrictRequestPolicy NormalizeStrictRequestPolicy(string body)
     {
         try
         {
             using var doc = JsonDocument.Parse(body);
             var root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object) return "";
-            var parts = new List<string>();
-            if (root.TryGetProperty("tool_choice", out var choice))
+            if (root.ValueKind != JsonValueKind.Object)
+                return InvalidStrictRequestPolicy();
+
+            var names = GetToolNames(root);
+            if (names.Count == 0)
+                return InvalidStrictRequestPolicy();
+            var choiceKind = StrictToolChoice.Optional;
+            string? namedFunction = null;
+            if (root.TryGetProperty("tool_choice", out var choice) && choice.ValueKind != JsonValueKind.Null)
             {
-                if (choice.ValueKind == JsonValueKind.String &&
-                    string.Equals(choice.GetString(), "none", StringComparison.Ordinal))
-                    return "Do not call any tool. Answer the original request in prose.";
-                if (choice.ValueKind == JsonValueKind.Object &&
-                    choice.TryGetProperty("function", out var fn) &&
-                    fn.ValueKind == JsonValueKind.Object &&
-                    fn.TryGetProperty("name", out var forcedName) &&
-                    forcedName.ValueKind == JsonValueKind.String &&
-                    !string.IsNullOrWhiteSpace(forcedName.GetString()))
+                if (choice.ValueKind == JsonValueKind.String)
                 {
-                    parts.Add($"Call exactly the function `{forcedName.GetString()}`. Do not call any other tool.");
+                    choiceKind = choice.GetString() switch
+                    {
+                        "auto" => StrictToolChoice.Optional,
+                        "none" => StrictToolChoice.None,
+                        "required" => StrictToolChoice.Required,
+                        _ => (StrictToolChoice)(-1)
+                    };
+                    if ((int)choiceKind < 0) return InvalidStrictRequestPolicy();
                 }
+                else if (choice.ValueKind == JsonValueKind.Object &&
+                         choice.TryGetProperty("type", out var type) &&
+                         type.ValueKind == JsonValueKind.String &&
+                         string.Equals(type.GetString(), "function", StringComparison.Ordinal) &&
+                         choice.TryGetProperty("function", out var fn) &&
+                         fn.ValueKind == JsonValueKind.Object &&
+                         fn.TryGetProperty("name", out var forcedName) &&
+                         forcedName.ValueKind == JsonValueKind.String &&
+                         !string.IsNullOrWhiteSpace(forcedName.GetString()))
+                {
+                    namedFunction = forcedName.GetString();
+                    if (!names.Contains(namedFunction!, StringComparer.Ordinal)) return InvalidStrictRequestPolicy();
+                    choiceKind = StrictToolChoice.Named;
+                }
+                else return InvalidStrictRequestPolicy();
             }
-            if (parts.Count == 0)
+
+            var parallelCallsDisabled = false;
+            if (root.TryGetProperty("parallel_tool_calls", out var parallel) && parallel.ValueKind != JsonValueKind.Null)
             {
-                var names = GetToolNames(root);
-                if (names.Count > 0)
-                {
-                    const int maxNames = 20;
-                    var shown = names.Take(maxNames).ToList();
-                    var suffix = names.Count > maxNames ? $" and {names.Count - maxNames} more" : "";
-                    parts.Add("Use only these offered functions: " +
-                              string.Join(", ", shown.Select(name => $"`{name}`")) + suffix + ".");
-                }
+                if (parallel.ValueKind is not JsonValueKind.True and not JsonValueKind.False)
+                    return InvalidStrictRequestPolicy();
+                parallelCallsDisabled = parallel.ValueKind == JsonValueKind.False;
             }
-            if (root.TryGetProperty("parallel_tool_calls", out var parallel) &&
-                parallel.ValueKind == JsonValueKind.False)
-                parts.Add("Emit exactly one tool call.");
-            if (root.TryGetProperty("max_calls", out var maxCalls) &&
-                maxCalls.ValueKind == JsonValueKind.Number &&
-                maxCalls.TryGetInt32(out var max) && max >= 0)
-                parts.Add(max == 0 ? "Do not emit any tool call." : $"Emit at most {max} tool call{(max == 1 ? "" : "s")}.");
-            return string.Join(" ", parts);
+            return new StrictRequestPolicy(true, choiceKind, namedFunction, parallelCallsDisabled, names);
         }
         catch (JsonException)
         {
-            return "";
+            return InvalidStrictRequestPolicy();
         }
+    }
+
+    private static StrictRequestPolicy InvalidStrictRequestPolicy() =>
+        new(false, StrictToolChoice.Optional, null, false, Array.Empty<string>());
+
+    private static string BuildStrictRequestContext(StrictRequestPolicy policy)
+    {
+        var parts = new List<string>();
+        switch (policy.Choice)
+        {
+            case StrictToolChoice.None:
+                parts.Add("Do not emit executable tool calls. Follow the original task and requested output format.");
+                break;
+            case StrictToolChoice.Required:
+                parts.Add("Use only these offered functions: " + FormatOfferedFunctions(policy.OfferedFunctions));
+                parts.Add("At least one offered function call is required.");
+                break;
+            case StrictToolChoice.Named:
+                parts.Add($"Call the exact required function `{policy.NamedFunction}`. Do not call any other tool.");
+                break;
+            default:
+                parts.Add("Calls are optional. Follow the original task and use only offered functions if a call is needed: " + FormatOfferedFunctions(policy.OfferedFunctions));
+                break;
+        }
+        if (policy.ParallelCallsDisabled)
+            parts.Add("Emit at most one tool call.");
+        return string.Join(" ", parts);
+    }
+
+    private static string FormatOfferedFunctions(IReadOnlyList<string> names)
+    {
+        const int maxNames = 20;
+        var shown = names.Take(maxNames).ToList();
+        var suffix = names.Count > maxNames ? $" and {names.Count - maxNames} more" : "";
+        return string.Join(", ", shown.Select(name => $"`{name}`")) + suffix + ".";
     }
 
     private static List<string> GetToolNames(JsonElement root)
@@ -606,13 +681,14 @@ public static class UnavailableToolRetryService
 
     private static void ReplaceContentWithPrefix(HttpResponseMessage response, byte[] prefix, Stream stream)
     {
-        var headers = response.Content.Headers.ToArray();
-        var content = new StreamContent(new PrefixStream(prefix, stream));
+        var previous = response.Content;
+        var headers = previous.Headers.ToArray();
+        var content = new StreamContent(new PrefixStream(prefix, stream, previous));
         foreach (var header in headers) content.Headers.TryAddWithoutValidation(header.Key, header.Value);
         response.Content = content;
     }
 
-    private sealed class PrefixStream(byte[] prefix, Stream inner) : Stream
+    private sealed class PrefixStream(byte[] prefix, Stream inner, HttpContent owner) : Stream
     {
         private int position;
         public override bool CanRead => true;
@@ -650,9 +726,18 @@ public static class UnavailableToolRetryService
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         protected override void Dispose(bool disposing)
         {
-            if (disposing) inner.Dispose();
+            if (disposing)
+            {
+                inner.Dispose();
+                owner.Dispose();
+            }
             base.Dispose(disposing);
         }
-        public override ValueTask DisposeAsync() => inner.DisposeAsync();
+        public override async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync();
+            owner.Dispose();
+            GC.SuppressFinalize(this);
+        }
     }
 }

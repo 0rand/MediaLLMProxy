@@ -8,6 +8,7 @@ using OAIPreRouter.Cli.Models;
 using OAIPreRouter.Cli.Services;
 using System.Diagnostics;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -142,10 +143,11 @@ public class Program
                 phase = "observation",
                 primary = new
                 {
-                    url = options.PrimaryBackend.BaseUrl,
+                    url = SafeHealthUrl(options.PrimaryBackend.BaseUrl),
                     temperature = (double?)options.PrimaryBackend.Temperature,
                     topP = (double?)options.PrimaryBackend.TopP,
                     toolOutputContract = options.PrimaryBackend.ToolOutputContract.ToString(),
+                    cureRawToolCallsRequested = options.PrimaryBackend.CureRawToolCalls,
                     cureRawToolCalls = effectiveCureRawToolCalls,
                     sampling = (object?)new
                     {
@@ -159,13 +161,15 @@ public class Program
                 systemPromptThresholdBytes = options.SystemPromptThresholdBytes,
                 fastLaneThresholdBytes = options.FastLaneThresholdBytes,
                 bridge = multimodal.Enabled
-                    ? new { enabled = true, vision = (string?)multimodal.VisionBackend.BaseUrl, model = (string?)multimodal.VisionModel, audio = (string?)multimodal.AudioBackend.BaseUrl, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)metrics.Snapshot() }
-                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, metrics = (object?)null },
-                loopGuard = new { enabled = loopGuard.Enabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)loopGuard.AdvisorBackend.BaseUrl, model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() },
+                    ? new { enabled = true, vision = (string?)SafeHealthUrl(multimodal.VisionBackend.BaseUrl), model = (string?)multimodal.VisionModel, audio = (string?)SafeHealthUrl(multimodal.AudioBackend.BaseUrl), videoSupport = multimodal.VideoSupport, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, urlPolicy = new { allowDataUrls = multimodal.UrlPolicy.AllowDataUrls, allowHttpsHostsSha256 = HashHealthHosts(multimodal.UrlPolicy.AllowHttpsHosts), maxMediaBytes = multimodal.UrlPolicy.MaxMediaBytes }, metrics = (object?)metrics.Snapshot() }
+                    : new { enabled = false, vision = (string?)null, model = (string?)null, audio = (string?)null, videoSupport = multimodal.VideoSupport, detourVision = multimodal.DetourVision, detourAudio = multimodal.DetourAudio, rehomeToolMedia = multimodal.RehomeToolMedia, rehomeAtEnd = multimodal.RehomeAtEnd, urlPolicy = new { allowDataUrls = multimodal.UrlPolicy.AllowDataUrls, allowHttpsHostsSha256 = HashHealthHosts(multimodal.UrlPolicy.AllowHttpsHosts), maxMediaBytes = multimodal.UrlPolicy.MaxMediaBytes }, metrics = (object?)null },
+                loopGuard = new { enabled = loopGuard.Enabled, wedgeEnabled = loopGuard.WedgeEnabled, threshold = loopGuard.ReasoningTokenThreshold, advisor = (string?)SafeHealthUrl(loopGuard.AdvisorBackend.BaseUrl), model = (string?)loopGuard.AdvisorModel, metrics = (object?)metrics.Snapshot() },
                 structuredOutput = new { disableThinkingForResponseFormat = structuredOutput.DisableThinkingForResponseFormat },
                 unavailableToolRetry = new
                 {
                     enabled = unavailableToolRetry.Enabled,
+                    policy = unavailableToolRetry.Enabled ? "strict-native-guard-retry-once" : "disabled",
+                    shouldRetryOverridePolicy = "no-request-header-override",
                     maxRetries = Math.Clamp(unavailableToolRetry.MaxRetries, 0, 1),
                     retryRawToolCallAborts = !strictNative && unavailableToolRetry.RetryRawToolCallAborts,
                     strictGuardOnly = strictNative,
@@ -889,7 +893,7 @@ public class Program
                                     var client2 = httpClientFactory.CreateClient("proxy");
                                     var resp2 = await client2.SendAsync(outbound2, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
                                     if (!resp2.IsSuccessStatusCode) { resp2.Dispose(); return null; }
-                                    return await resp2.Content.ReadAsStreamAsync(ctx.RequestAborted);
+                                    return await HttpResponseOwnedStream.OpenAsync(resp2, ctx.RequestAborted);
                                 },
                                 abortAttempt1: () => upstream.Dispose(),
                                 ctx.RequestAborted);
@@ -922,8 +926,9 @@ public class Program
                 catch (Exception streamEx) when (!streamEx.IsOperationCanceled())
                 {
                     log.LogError(streamEx, "[{RequestId}] STREAM_ERROR elapsedMs={ElapsedMs}", requestId, sw.ElapsedMilliseconds);
-                    if (backendCureRawToolCalls)
-                        ctx.Abort(); // Do not turn an invalid/truncated tool call into a successful completion.
+                    // Headers may already be committed. Abort every forwarding failure so a
+                    // StrictNative read/write failure cannot look like a clean completed SSE EOF.
+                    ctx.Abort();
                 }
             }
             catch (OperationCanceledException ex) when (ctx.RequestAborted.IsCancellationRequested)
@@ -1005,5 +1010,24 @@ public class Program
     private static string JoinUrl(string baseUrl, string relative)
     {
         return $"{baseUrl.TrimEnd('/')}/{relative.TrimStart('/')}";
+    }
+
+    private static string SafeHealthUrl(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
+            return "<invalid-url>";
+
+        var hostName = uri.DnsSafeHost;
+        var host = uri.HostNameType == UriHostNameType.IPv6 ? $"[{hostName}]" : hostName;
+        var port = uri.IsDefaultPort ? string.Empty : $":{uri.Port}";
+        return $"{uri.Scheme}://{host}{port}{uri.AbsolutePath}";
+    }
+
+    private static string HashHealthHosts(IEnumerable<string> hosts)
+    {
+        var canonical = string.Join("\n", hosts.OrderBy(value => value, StringComparer.Ordinal));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
     }
 }

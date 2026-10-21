@@ -1,0 +1,14 @@
+{
+  "cases": [
+    {
+      "name": "transport_truncated_after_finish",
+      "contract": {"kind": "truncated"},
+      "raw_sse": "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n"
+    },
+    {
+      "name": "literal_fabricated_as_call",
+      "contract": {"kind": "literal", "literal": "literal"},
+      "raw_sse": "data: {\"choices\":[{\"delta\":{\"content\":\"literal\",\"tool_calls\":[{\"id\":\"fabricated\"}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+    }
+  ]
+}

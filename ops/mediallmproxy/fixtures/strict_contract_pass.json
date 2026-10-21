@@ -1,0 +1,29 @@
+{
+  "cases": [
+    {
+      "name": "success_finish_usage_incremental_no_tools",
+      "contract": {"kind": "complete_success", "trailing_usage": true, "incremental_prose": true},
+      "raw_sse": "data: {\"choices\":[{\"delta\":{\"content\":\"First sentence. \"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Second sentence.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\ndata: [DONE]\n\n"
+    },
+    {
+      "name": "success_incremental_prose_with_offered_tools",
+      "contract": {"kind": "complete_success", "incremental_prose": true},
+      "raw_sse": "data: {\"choices\":[{\"delta\":{\"content\":\"Tools are optional. \"},\"finish_reason\":null}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"This response uses none.\"},\"finish_reason\":null}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\r\n\r\n"
+    },
+    {
+      "name": "complete_native_rejection",
+      "contract": {"kind": "native_rejection"},
+      "raw_sse": "data: {\"error\":{\"type\":\"model_output_error\",\"code\":\"unavailable_tool_call\",\"source\":\"tensorfold.tool_output_guard\",\"message\":\"function is not offered\"}}\n\ndata: [DONE]\n\n"
+    },
+    {
+      "name": "native_call_preserved_exactly",
+      "contract": {"kind": "native_call", "expected_calls": [{"index": 0, "id": "call_fixture_native", "type": "function", "function": {"name": "get_status", "arguments": "{\"service\":\"tensorfold\"}"}}]},
+      "raw_sse": "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_fixture_native\",\"type\":\"function\",\"function\":{\"name\":\"get_status\",\"arguments\":\"{\\\"service\\\":\\\"tensorfold\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+    },
+    {
+      "name": "literal_protocol_text_never_becomes_call",
+      "contract": {"kind": "literal", "literal": "    <tool_call>{\"name\":\"example\"}</tool_call>"},
+      "raw_sse": "data: {\"choices\":[{\"delta\":{\"content\":\"    <tool_call>\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"{\\\"name\\\":\\\"example\\\"}</tool_call>\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+    }
+  ]
+}

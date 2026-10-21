@@ -66,7 +66,8 @@ public class StrictToolRetryTests
         Assert.Contains("did not match the offered function schema", banner);
         Assert.Contains("`task`", banner);
         Assert.Contains("`read_file`", banner);
-        Assert.Contains("Emit exactly one tool call", banner);
+        Assert.Contains("Calls remain optional", banner);
+        Assert.Contains("Emit at most one tool call", banner);
         Assert.Contains(Options.InjectionMarker, banner);
         Assert.DoesNotContain("abc123", banner);
         Assert.Equal(0.4, retry["temperature"]!.GetValue<double>());
@@ -108,6 +109,29 @@ public class StrictToolRetryTests
     }
 
     [Fact]
+    public async Task StrictRetrySecondNonGuardFailurePassesThroughUnchanged()
+    {
+        var sent = 0;
+        var metrics = new BridgeMetrics();
+        using var result = await Send((_, _) =>
+        {
+            sent++;
+            return sent == 1
+                ? Reply(StrictError, false, HttpStatusCode.InternalServerError)
+                : Reply(NonGuardError, false, HttpStatusCode.BadGateway);
+        }, metrics: metrics);
+
+        Assert.Equal(2, sent);
+        Assert.Equal(HttpStatusCode.BadGateway, result.StatusCode);
+        Assert.Equal(NonGuardError, await result.Content.ReadAsStringAsync());
+        Assert.Equal("1", result.Headers.GetValues("X-PreRouter-Tool-Retries").Single());
+        Assert.False(result.Headers.Contains("X-PreRouter-Tool-Rejected"));
+        var snapshot = Snapshot(metrics);
+        Assert.Equal(1, snapshot["unavailable_tool_retry_fail"]!.GetValue<int>());
+        Assert.Equal(1, snapshot["tool_retry_fail_by_category"]!["second_attempt_error"]!.GetValue<int>());
+    }
+
+    [Fact]
     public async Task NonGuardUnavailableToolErrorIsNotRetried()
     {
         var sent = 0;
@@ -143,7 +167,9 @@ public class StrictToolRetryTests
         Assert.Equal(2, sent.Count);
         var banner = JsonNode.Parse(sent[1])!["messages"]![1]!["content"]!.GetValue<string>();
         Assert.Contains(Options.StrictGuardBannerIntro, banner);
-        Assert.Contains("Use only these offered functions", banner);
+        Assert.Contains("Calls are optional", banner);
+        Assert.Contains("`task`", banner);
+        Assert.Contains("`read_file`", banner);
         Assert.DoesNotContain("rejected by the strict validator", banner);
     }
 
@@ -165,6 +191,83 @@ public class StrictToolRetryTests
         Assert.Contains("recovered", text);
         Assert.DoesNotContain("heartbeat", text);
         Assert.Equal("1", result.Headers.GetValues("X-PreRouter-Tool-Retries").Single());
+    }
+
+    [Fact]
+    public async Task StrictStreamingMultilineGuardEventWithCommentsAndCrlfRetriesAfterSeparator()
+    {
+        var split = StrictErrorLine.IndexOf(",\"source\"", StringComparison.Ordinal);
+        Assert.True(split > 0);
+        var first = ": heartbeat\r\n\r\n" +
+                    "data: " + StrictErrorLine[..(split + 1)] + "\r\n" +
+                    "data: " + StrictErrorLine[(split + 1)..] + "\r\n\r\n";
+        var sent = 0;
+        using var result = await Send((_, _) =>
+        {
+            sent++;
+            return sent == 1
+                ? Reply(first, true)
+                : Reply(Chunk("recovered") + Terminal, true);
+        }, streaming: true);
+
+        Assert.Equal(2, sent);
+        Assert.Contains("recovered", await result.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task StrictStreamingIncompleteGuardEventDoesNotRetry()
+    {
+        var sent = 0;
+        var incomplete = "data: " + StrictErrorLine + "\n";
+        using var result = await Send((_, _) =>
+        {
+            sent++;
+            return Reply(incomplete, true);
+        }, streaming: true);
+
+        Assert.Equal(1, sent);
+        Assert.Equal(incomplete, await result.Content.ReadAsStringAsync());
+        Assert.Equal("0", result.Headers.GetValues("X-PreRouter-Tool-Retries").Single());
+    }
+
+    [Fact]
+    public async Task StrictStreamingOversizedUnterminatedPreambleIsBoundedAndNotRetried()
+    {
+        var pipe = new Pipe();
+        var sends = 0;
+        var pending = UnavailableToolRetryService.SendAsync((_, _) =>
+        {
+            sends++;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(pipe.Reader.AsStream())
+                {
+                    Headers = { ContentType = new("text/event-stream") }
+                }
+            });
+        }, Request, true, false, Options, new BridgeMetrics(), CancellationToken.None,
+            contract: ToolOutputContract.StrictNative);
+
+        await pipe.Writer.WriteAsync(Encoding.UTF8.GetBytes("data: " + new string('x', 70 * 1024)));
+        using var response = await pending.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(1, sends);
+        Assert.Equal("0", response.Headers.GetValues("X-PreRouter-Tool-Retries").Single());
+        await pipe.Writer.CompleteAsync();
+    }
+
+    [Fact]
+    public async Task StrictStreamingPrefixDisposesOriginalContent()
+    {
+        var original = new TrackingStreamContent(new MemoryStream(Encoding.UTF8.GetBytes(Chunk("visible"))));
+        original.Headers.ContentType = new("text/event-stream");
+        var result = await UnavailableToolRetryService.SendAsync((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = original
+        }), Request, true, false, Options, new BridgeMetrics(), CancellationToken.None,
+            contract: ToolOutputContract.StrictNative);
+
+        result.Dispose();
+        Assert.True(original.WasDisposed);
     }
 
     [Fact]
@@ -219,9 +322,10 @@ public class StrictToolRetryTests
 
         Assert.Equal(2, sent.Count);
         var banner = JsonNode.Parse(sent[1])!["messages"]![1]!["content"]!.GetValue<string>();
-        Assert.Contains("Do not call any tool", banner);
-        Assert.Contains("Do not emit any tool call", banner);
-        Assert.DoesNotContain("Emit a complete tool call", banner);
+        Assert.Contains("Follow the original task and requested output format", banner);
+        Assert.Contains("Do not emit an executable tool call", banner);
+        Assert.Contains("Preserve any requested inert tool or protocol examples as text", banner);
+        Assert.DoesNotContain("Emit at least one complete call", banner);
     }
 
     [Fact]
@@ -244,8 +348,112 @@ public class StrictToolRetryTests
 
         Assert.Equal(2, sent.Count);
         var banner = JsonNode.Parse(sent[1])!["messages"]![1]!["content"]!.GetValue<string>();
-        Assert.Contains("Call exactly the function `task`", banner);
+        Assert.Contains("Call the exact required function `task`", banner);
         Assert.DoesNotContain("read_file", banner);
+    }
+
+    [Fact]
+    public void StrictBannerNormalizesOptionalChoiceVariants()
+    {
+        foreach (var choice in new[] { "", "\"tool_choice\":null,", "\"tool_choice\":\"auto\"," })
+        {
+            var request = "{" + choice + "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"task\"}}]}";
+            var banner = UnavailableToolRetryService.BuildStrictGuardBanner(
+                request, Options, new(UnavailableToolRetryService.GuardSource, "invalid", null, null));
+
+            Assert.Contains("Calls remain optional", banner);
+            Assert.DoesNotContain("At least one offered function call is required", banner);
+            Assert.DoesNotContain("Emit at most one tool call", banner);
+        }
+    }
+
+    [Fact]
+    public void StrictBannerRequiredAndParallelFalseKeepTheirIndependentBounds()
+    {
+        const string required = """
+            {"tool_choice":"required","parallel_tool_calls":false,"max_calls":0,
+             "tools":[{"type":"function","function":{"name":"task"}}]}
+            """;
+
+        var banner = UnavailableToolRetryService.BuildStrictGuardBanner(
+            required, Options, new(UnavailableToolRetryService.GuardSource, "invalid", null, null));
+
+        Assert.Contains("At least one offered function call is required", banner);
+        Assert.Contains("Emit at most one tool call", banner);
+        Assert.DoesNotContain("max_calls", banner, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Do not emit an executable tool call", banner);
+    }
+
+    [Fact]
+    public async Task InvalidPoliciesPreserveBackendErrorWithoutRetryOrRewrite()
+    {
+        var invalidRequests = new[]
+        {
+            """{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"task"}}],"tool_choice":{"type":"function","function":{"name":"not_offered"}}}""",
+            """{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"task"}}],"tool_choice":"always"}""",
+            """{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"task"}}],"parallel_tool_calls":"false"}""",
+            """{"messages":[{"role":"user","content":"hi"}],"tools":[{}],"tool_choice":"required"}"""
+        };
+        foreach (var invalidRequest in invalidRequests)
+        {
+            var sent = 0;
+            var metrics = new BridgeMetrics();
+            using var result = await Send((_, _) =>
+            {
+                sent++;
+                return Reply(StrictError, false, HttpStatusCode.InternalServerError);
+            }, request: invalidRequest, metrics: metrics);
+
+            Assert.Equal(1, sent);
+            Assert.Equal(StrictError, await result.Content.ReadAsStringAsync());
+            Assert.False(result.Headers.Contains("X-PreRouter-Tool-Retries"));
+            Assert.False(result.Headers.Contains("X-PreRouter-Tool-Rejected"));
+            var snapshot = Snapshot(metrics);
+            Assert.Equal(0, snapshot["unavailable_tool_retries"]!.GetValue<int>());
+            Assert.Null(UnavailableToolRetryService.BuildStrictGuardRetryBody(
+                invalidRequest, Options, new(UnavailableToolRetryService.GuardSource, "invalid", null, null)));
+        }
+    }
+
+    [Fact]
+    public async Task StrictRetryPreservesExactLiteralProtocolCopierReplayUnderAutoAndNone()
+    {
+        const string literal = "Example only: <tool_call>{\"name\":\"task\",\"arguments\":{}}</tool_call>";
+        foreach (var choice in new[] { "auto", "none" })
+        {
+            var request = new JsonObject
+            {
+                ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = "Copy exactly: " + literal }),
+                ["tools"] = JsonNode.Parse(Request)!["tools"]!.DeepClone(),
+                ["tool_choice"] = choice,
+                ["temperature"] = 0.4,
+                ["chat_template_kwargs"] = new JsonObject { ["enable_thinking"] = true }
+            }.ToJsonString();
+            var sent = new List<string>();
+            using var result = await Send((body, _) =>
+            {
+                sent.Add(body);
+                return sent.Count == 1
+                    ? Reply(StrictError, false, HttpStatusCode.InternalServerError)
+                    : Reply(Completion(literal), false);
+            }, request: request);
+
+            Assert.Equal(2, sent.Count);
+            Assert.Equal(literal, JsonNode.Parse(await result.Content.ReadAsStringAsync())!["choices"]![0]!["message"]!["content"]!.GetValue<string>());
+            var retry = JsonNode.Parse(sent[1])!;
+            Assert.Equal("Copy exactly: " + literal, retry["messages"]![0]!["content"]!.GetValue<string>());
+            Assert.Equal(JsonNode.Parse(Request)!["tools"]!.ToJsonString(), retry["tools"]!.ToJsonString());
+            Assert.Equal(0.4, retry["temperature"]!.GetValue<double>());
+            Assert.True(retry["chat_template_kwargs"]!["enable_thinking"]!.GetValue<bool>());
+            var banner = retry["messages"]![1]!["content"]!.GetValue<string>();
+            if (choice == "none")
+            {
+                Assert.Contains("Do not emit an executable tool call", banner);
+                Assert.Contains("Preserve any requested inert tool or protocol examples as text", banner);
+            }
+            else
+                Assert.Contains("Preserve requested literal or inert protocol examples as text", banner);
+        }
     }
 
     [Fact]
@@ -385,4 +593,15 @@ public class StrictToolRetryTests
 
     private const string Terminal =
         "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+    private sealed class TrackingStreamContent(Stream stream) : StreamContent(stream)
+    {
+        public bool WasDisposed { get; private set; }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) WasDisposed = true;
+            base.Dispose(disposing);
+        }
+    }
 }

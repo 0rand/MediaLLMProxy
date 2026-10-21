@@ -48,9 +48,20 @@ In strict-native mode:
 - A retry is allowed only for a terminal `model_output_error` with
   `code=unavailable_tool_call` and
   `source=tensorfold.tool_output_guard`. Other errors pass through.
-- The retry appends one `role: user` message. It includes the offered tool
-  names, the request `tool_choice`, `parallel_tool_calls` and `max_calls`
-  constraints, and a request to emit one complete call with schema-valid JSON.
+- The retry appends one `role: user` message. It preserves the original task,
+  offered schemas, thinking settings and sampling. Its policy guidance is
+  normalized from `tool_choice` and `parallel_tool_calls`: omitted, `null` and
+  `auto` keep calls optional; `none` forbids executable calls but preserves
+  requested inert examples as text; `required` asks for at least one offered,
+  schema-valid call; and a named choice requires that exact offered function.
+  `parallel_tool_calls:false` means at most one call, not exactly one under
+  `auto`.
+- The pinned backend ignores a wire-level `max_calls` field. The proxy does not
+  describe or enforce it in retry guidance. `tool_choice:"none"` is the
+  supported no-call policy. A negotiated call-limit API would require separate
+  request validation and integration coverage.
+- Invalid or incompatible tool policy is left to the backend. The proxy does
+  not retry or rewrite its error into a different policy.
 - The message never includes rejected arguments, rejected prose or raw model
   output. The backend's payload-free `rejection_id` is logged, not sent to the
   model.
@@ -117,12 +128,13 @@ The retry starts from the final forwarded request after sampling, media rewrites
 and request-side LoopGuard evaluation. It appends exactly one new `role: user`
 message. Failed assistant output and generated arguments are not included.
 
-In strict-native mode, `StrictGuardBannerIntro` opens the message. The proxy
-appends a category-specific sentence when the backend supplies a safe
-`category`, then the offered tool names and the request `tool_choice`,
-`parallel_tool_calls` and `max_calls` constraints. Set
-`IncludeRequestContext=false` to omit the request context. The message never
-contains rejected arguments or output.
+In strict-native mode, `StrictGuardBannerIntro` opens the message. The default
+intro is neutral, but a custom intro is operator-supplied text and can conflict
+with normalized policy guidance. The proxy appends a category-specific sentence
+when the backend supplies a safe `category`, then the normalized tool policy.
+Set `IncludeRequestContext=false` to omit the offered-function context, while
+the policy-safe corrective guidance remains. The message never contains
+rejected arguments or output.
 
 In legacy mode, `InjectionMarker` prefixes the corrective message. `Banner`
 controls the message for an unavailable tool; `RawToolCallBanner` controls the
@@ -138,6 +150,14 @@ at 1; setting it to 0 disables re-issues while keeping buffered validation activ
 The guard does not retry requests without a non-empty `tools` array, unrelated
 backend errors, network failures or authentication failures. Client cancellation
 is propagated rather than starting another attempt.
+
+The current retry authorization is unchanged by this guidance. For eligible
+non-streaming strict guard errors, the configured single retry still overrides a
+backend `x-should-retry:false` response hint. That behavior requires a separate,
+explicit policy decision before changing it. Streaming remains conservative: the
+proxy retries only an initial preamble guard error before any client-visible
+frame. It does not broaden recovery past role-only, reasoning, content, or other
+visible frames.
 
 ## Final Errors
 
