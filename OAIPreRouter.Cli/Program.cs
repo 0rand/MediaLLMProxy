@@ -795,7 +795,7 @@ public class Program
                 try
                 {
                     var toolNames = backend.CureRawToolCalls ? RawToolCallCure.AllowedNames(forwarded) : new HashSet<string>();
-                    var cure = !retryEnabled && backend.CureRawToolCalls && toolNames.Count > 0 && upstream.IsSuccessStatusCode;
+                    var cure = backend.CureRawToolCalls && toolNames.Count > 0 && upstream.IsSuccessStatusCode;
                     if (cure && isStreaming)
                         await SseToolCallCure.PipeAsync(ForwardResponse, ctx.Response.Body, toolNames, ctx.RequestAborted,
                             count => log.LogInformation("[{RequestId}] TOOL_CALL_CURE converted {Count} raw tool calls (streaming)", requestId, count));

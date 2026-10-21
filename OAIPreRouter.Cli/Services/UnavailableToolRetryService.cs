@@ -81,8 +81,9 @@ public static class UnavailableToolRetryService
     }
 
     /// <summary>
-    /// Buffer and validate before exposing output. Both rejection types share one retry;
-    /// failed attempts and their arguments never enter the client's conversation.
+    /// Non-streaming responses are buffered and validated before exposing output. A streaming
+    /// response is retried only when its first SSE data frame is the unavailable-tool error;
+    /// once any frame can be forwarded, replaying would duplicate visible model output.
     /// The returned response is owned by the caller. Transport failures are not retried.
     /// </summary>
     public static async Task<HttpResponseMessage> SendAsync(
@@ -106,6 +107,28 @@ public static class UnavailableToolRetryService
             try
             {
                 if (!eligible) return response;
+                if (streaming && response.Content.Headers.ContentType?.MediaType == "text/event-stream")
+                {
+                    var first = await ReadSseLineAsync(await response.Content.ReadAsStreamAsync(ct), ct);
+                    if (IsUnavailableErrorFrame(first.Text))
+                    {
+                        var earlyRetryBody = attempt == 0 && opts.MaxRetries > 0 ? BuildRetryBody(body, opts) : null;
+                        if (earlyRetryBody != null)
+                        {
+                            response.Dispose();
+                            metrics.UnavailableToolRetry();
+                            onRetry?.Invoke(ErrorCode);
+                            request = earlyRetryBody;
+                            continue;
+                        }
+                        response.Headers.Remove("X-PreRouter-Tool-Rejected");
+                        response.Headers.TryAddWithoutValidation("X-PreRouter-Tool-Rejected", ErrorCode);
+                    }
+                    ReplaceContentWithPrefix(response, first.Bytes, first.Stream);
+                    response.Headers.Remove("X-PreRouter-Tool-Retries");
+                    response.Headers.TryAddWithoutValidation("X-PreRouter-Tool-Retries", attempt.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    return response;
+                }
                 await response.Content.LoadIntoBufferAsync(opts.MaxResponseBytes, ct);
                 var text = await response.Content.ReadAsStringAsync(ct);
                 var unavailable = IsErrorJson(text) || (streaming && ContainsErrorFrame(text));
@@ -197,5 +220,77 @@ public static class UnavailableToolRetryService
             catch (JsonException) { }
         }
         return false;
+    }
+
+    private static bool IsUnavailableErrorFrame(string line)
+    {
+        if (!line.StartsWith("data:", StringComparison.Ordinal)) return false;
+        var payload = line[5..].Trim();
+        return payload.Length > 0 && payload != "[DONE]" && IsErrorJson(payload);
+    }
+
+    private static async Task<(string Text, byte[] Bytes, Stream Stream)> ReadSseLineAsync(Stream stream, CancellationToken ct)
+    {
+        using var bytes = new MemoryStream();
+        var one = new byte[1];
+        while (await stream.ReadAsync(one.AsMemory(), ct) is var read && read > 0)
+        {
+            bytes.WriteByte(one[0]);
+            if (one[0] == (byte)'\n') break;
+        }
+        var prefix = bytes.ToArray();
+        return (Encoding.UTF8.GetString(prefix).TrimEnd('\r', '\n'), prefix, stream);
+    }
+
+    private static void ReplaceContentWithPrefix(HttpResponseMessage response, byte[] prefix, Stream stream)
+    {
+        var headers = response.Content.Headers.ToArray();
+        var content = new StreamContent(new PrefixStream(prefix, stream));
+        foreach (var header in headers) content.Headers.TryAddWithoutValidation(header.Key, header.Value);
+        response.Content = content;
+    }
+
+    private sealed class PrefixStream(byte[] prefix, Stream inner) : Stream
+    {
+        private int position;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+        public override int Read(Span<byte> buffer)
+        {
+            if (position < prefix.Length)
+            {
+                var copied = Math.Min(buffer.Length, prefix.Length - position);
+                prefix.AsSpan(position, copied).CopyTo(buffer);
+                position += copied;
+                return copied;
+            }
+            return inner.Read(buffer);
+        }
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            if (position < prefix.Length)
+            {
+                var copied = Math.Min(buffer.Length, prefix.Length - position);
+                prefix.AsMemory(position, copied).CopyTo(buffer);
+                position += copied;
+                return copied;
+            }
+            return await inner.ReadAsync(buffer, ct);
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) inner.Dispose();
+            base.Dispose(disposing);
+        }
+        public override ValueTask DisposeAsync() => inner.DisposeAsync();
     }
 }
