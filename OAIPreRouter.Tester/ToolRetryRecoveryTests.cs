@@ -1,4 +1,5 @@
 using System.Net;
+using System.IO.Pipelines;
 using System.Text;
 using System.Text.Json.Nodes;
 using OAIPreRouter.Cli.Models;
@@ -14,18 +15,16 @@ public class ToolRetryRecoveryTests
     private const string InvalidRaw = "<|DSML|tool_calls><|DSML|invoke name=\"task\"><|DSML|parameter name=\"x\">unfinished";
     private static readonly UnavailableToolRetryOptions Options = new() { Enabled = true };
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task RawToolAbortRetriesWithCorrectiveUserBanner(bool streaming)
+    [Fact]
+    public async Task RawToolAbortRetriesWithCorrectiveUserBanner()
     {
         var sent = new List<string>();
         var reasons = new List<string>();
         using var result = await Run((body, _) =>
         {
             sent.Add(body);
-            return Reply(sent.Count == 1 ? Raw(streaming) : Success(streaming), streaming);
-        }, streaming, onRetry: reasons.Add);
+            return Reply(sent.Count == 1 ? Raw(false) : Success(false), false);
+        }, false, onRetry: reasons.Add);
         Assert.Equal(2, sent.Count);
         Assert.Equal([UnavailableToolRetryService.RawToolErrorCode], reasons);
         var retry = JsonNode.Parse(sent[1])!;
@@ -60,29 +59,47 @@ public class ToolRetryRecoveryTests
         Assert.DoesNotContain("unavailable_tool_call", await result.Content.ReadAsStringAsync());
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task RepeatedRawAbortReturnsStructuredErrorWithoutReset(bool streaming)
+    [Fact]
+    public async Task StreamingReasoningReturnsBeforeUpstreamCompletesAndIsNotRetried()
+    {
+        var pipe = new Pipe();
+        var sends = 0;
+        var pending = UnavailableToolRetryService.SendAsync((_, _) =>
+        {
+            sends++;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(pipe.Reader.AsStream()) { Headers = { ContentType = new("text/event-stream") } }
+            });
+        }, Request, true, true, Options, new BridgeMetrics(), CancellationToken.None);
+        await Task.Delay(10);
+        Assert.False(pending.IsCompleted);
+        await pipe.Writer.WriteAsync(Encoding.UTF8.GetBytes("data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking\"}}]}\n\n"));
+        using var response = await pending.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, sends);
+        using var stream = await response.Content.ReadAsStreamAsync();
+        var buffer = new byte[256];
+        var read = await stream.ReadAsync(buffer).AsTask().WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Contains("\"reasoning\":\"thinking\"", Encoding.UTF8.GetString(buffer, 0, read));
+        await pipe.Writer.CompleteAsync();
+    }
+
+    [Fact]
+    public async Task RepeatedRawAbortReturnsStructuredErrorWithoutReset()
     {
         var sends = 0;
-        using var result = await Run((_, _) => { sends++; return Reply(Raw(streaming), streaming); }, streaming, Options with { MaxRetries = 99 });
+        using var result = await Run((_, _) => { sends++; return Reply(Raw(false), false); }, false, Options with { MaxRetries = 99 });
         Assert.Equal(2, sends);
-        Assert.Equal(streaming ? HttpStatusCode.OK : HttpStatusCode.BadGateway, result.StatusCode);
+        Assert.Equal(HttpStatusCode.BadGateway, result.StatusCode);
         var text = await result.Content.ReadAsStringAsync();
         Assert.Contains("\"code\":\"invalid_raw_tool_call\"", text);
         Assert.DoesNotContain("unfinished", text);
-        if (streaming)
-        {
-            Assert.Equal(1, text.Split("data: [DONE]").Length - 1);
-            Assert.DoesNotContain("\"finish_reason\":\"stop\"", text);
-        }
     }
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task DifferentRejectionsShareOneBudget(bool firstRaw)
+    public async Task UpfrontUnavailableRetryDoesNotReplayVisibleSecondAttempt(bool firstRaw)
     {
         var sends = 0;
         using var result = await Run((_, _) =>
@@ -91,30 +108,30 @@ public class ToolRetryRecoveryTests
             var raw = sends == 1 ? firstRaw : !firstRaw;
             return Reply(raw ? Raw(true) : "data: " + Error + "\n\ndata: [DONE]\n\n", true);
         }, true);
-        Assert.Equal(2, sends);
+        Assert.Equal(firstRaw ? 1 : 2, sends);
         var output = await result.Content.ReadAsStringAsync();
-        Assert.Contains(firstRaw ? "unavailable_tool_call" : "invalid_raw_tool_call", output);
+        Assert.Contains("failed reasoning", output);
     }
 
     [Fact]
-    public async Task ValidRawCallIsConvertedWithoutRetry()
+    public async Task StreamingRawCallIsLeftForTheLiveCureWithoutRetry()
     {
         var sends = 0;
         var raw = "<|DSML|tool_calls><|DSML|invoke name=\"task\"></|DSML|invoke></|DSML|tool_calls>";
         using var result = await Run((_, _) => { sends++; return Reply(Chunk(raw) + Terminal, true); }, true);
         Assert.Equal(1, sends);
-        Assert.Contains("\"finish_reason\":\"tool_calls\"", await result.Content.ReadAsStringAsync());
+        Assert.Contains("\"content\"", await result.Content.ReadAsStringAsync());
     }
 
     [Fact]
-    public async Task NativeCallBeforeLaterRejectionIsNotExposed()
+    public async Task NativeCallBeforeLaterRejectionIsNotReplayed()
     {
         var sends = 0;
         var mixed = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"must_not_escape\"}]},\"finish_reason\":null}]}\n\n" +
             "data: " + Error + "\n\ndata: [DONE]\n\n";
         using var result = await Run((_, _) => { sends++; return Reply(sends == 1 ? mixed : Success(true), true); }, true);
-        Assert.Equal(2, sends);
-        Assert.DoesNotContain("must_not_escape", await result.Content.ReadAsStringAsync());
+        Assert.Equal(1, sends);
+        Assert.Contains("must_not_escape", await result.Content.ReadAsStringAsync());
     }
 
     [Theory]
@@ -137,7 +154,7 @@ public class ToolRetryRecoveryTests
     public async Task RawAbortGateCanDisableRetryButStillReturnsError()
     {
         var sends = 0;
-        using var result = await Run((_, _) => { sends++; return Reply(Raw(true), true); }, true,
+        using var result = await Run((_, _) => { sends++; return Reply(Raw(false), false); }, false,
             Options with { RetryRawToolCallAborts = false });
         Assert.Equal(1, sends);
         Assert.Contains("invalid_raw_tool_call", await result.Content.ReadAsStringAsync());
@@ -178,8 +195,8 @@ public class ToolRetryRecoveryTests
         await Assert.ThrowsAsync<HttpRequestException>(() => Run((_, _) =>
         {
             sends++;
-            return Reply(new string('x', 1024), true);
-        }, true, Options with { MaxResponseBytes = 32 }));
+            return Reply(new string('x', 1024), false);
+        }, false, Options with { MaxResponseBytes = 32 }));
         Assert.Equal(1, sends);
     }
 
@@ -187,7 +204,7 @@ public class ToolRetryRecoveryTests
     public async Task ZeroBudgetReturnsRawErrorWithoutReissue()
     {
         var sends = 0;
-        using var result = await Run((_, _) => { sends++; return Reply(Raw(true), true); }, true,
+        using var result = await Run((_, _) => { sends++; return Reply(Raw(false), false); }, false,
             Options with { MaxRetries = 0 });
         Assert.Equal(1, sends);
         Assert.Contains("invalid_raw_tool_call", await result.Content.ReadAsStringAsync());

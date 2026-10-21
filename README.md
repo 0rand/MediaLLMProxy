@@ -453,18 +453,22 @@ preserves string parameter whitespace and entities exactly, and parses
 again. Tool names must be declared by the request; `tool_choice: "none"` disables
 curing and a forced function choice restricts the accepted name.
 
-The streaming filter retains partial opening markers across chunk boundaries,
-including chunks that also carry role/reasoning fields. Tool-call conversion is
-deferred until a successful terminal chunk so incomplete or length-limited
+The streaming filter buffers each choice until its terminal chunk, so fenced/inline
+code, quoted text and Markdown blockquotes remain literal even when delimiters
+are split across chunks. Tool-call conversion is deferred until a successful
+terminal chunk so incomplete or length-limited
 arguments never become executable calls. Invalid/truncated detected blocks and
-buffers over 4,194,304 characters abort the stream instead of reporting successful completion.
-Usage chunks, surrounding prose, reasoning and parallel tool-call indices are
-preserved. The filter runs after observation injection or loop-guard wedge output.
+buffers over 4,194,304 characters end with an error instead of reporting successful completion.
+Usage chunks, comments, errors, `reasoning`, `reasoning_content` and parallel
+tool-call indices are preserved; reasoning fields are forwarded immediately while
+answer content waits for its choice terminal. Invalid raw markup produces a
+terminal `invalid_raw_tool_call` SSE error rather than a successful completion.
+The filter runs after observation injection or loop-guard wedge output.
 Non-streaming unparseable blocks remain unchanged rather than becoming calls.
 
-This is an opt-in compatibility heuristic, not a security boundary: prose showing
-a complete supported call to an allowed tool can also be interpreted as a call.
-It does not repair calls to undeclared tools or invent missing arguments.
+This is an opt-in compatibility heuristic, not a security boundary: nonliteral
+prose showing a complete supported call to an allowed tool can be interpreted as
+a call. It does not repair calls to undeclared tools or invent missing arguments.
 
 Adapted from [opencode_compat_proxy](https://github.com/0rand/opencode_compat_proxy),
 with attribution in `THIRD-PARTY-NOTICES.md`.

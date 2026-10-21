@@ -48,8 +48,9 @@ requires deploying an updated binary before restarting. See
 ## Recovery Contract
 
 The stack's `model_output_error` / `unavailable_tool_call` error triggers recovery
-in HTTP JSON or an SSE error frame. With curing enabled, proxy raw-tool validation
-failures also trigger recovery when `RetryRawToolCallAborts` is true. These include
+for HTTP JSON and for an SSE error frame that is received before any SSE frame is
+forwarded. With curing enabled, non-streaming proxy raw-tool validation failures
+also trigger recovery when `RetryRawToolCallAborts` is true. These include
 malformed/incomplete markup and raw calls that name an undeclared tool.
 
 The retry starts from the final forwarded request after sampling, media rewrites
@@ -82,7 +83,9 @@ proxy raw-tool rejection produces:
   "error": {
     "type": "model_output_error",
     "code": "invalid_raw_tool_call",
-    "message": "The model response contained an invalid or incomplete raw tool call."
+    "source": "mediallmproxy.raw_tool_guard",
+    "reason": "invalid_raw_call",
+    "message": "The model response contained an invalid raw tool call (reason: invalid_raw_call)."
   }
 }
 ```
@@ -91,27 +94,38 @@ Non-streaming raw-tool rejection uses HTTP 502. Streaming raw-tool rejection use
 HTTP 200 with one SSE error frame and `data: [DONE]`, not a successful terminal
 chunk or a connection reset. No rejected call arguments are returned.
 
-With recovery disabled, the existing unbuffered cure-only path can still abort
-the connection on rejected raw markup. Enable both features to use corrective
-retry and structured final errors instead.
+The proxy's payload-free `reason` is one of `buffer_limit`,
+`mixed_native_raw_calls`, `incomplete_raw_call`, `invalid_raw_call`, or
+`non_tool_finish`. It is also repeated in the human message for clients that
+retain only that field.
+
+With recovery disabled, curing still returns the structured raw-tool error; the
+retry feature only controls whether an eligible non-streaming response is reissued.
 
 ## Streaming Tradeoffs
 
-Each eligible attempt is fully buffered and validated before reaching the client.
-This prevents reasoning or executable calls from a rejected attempt from leaking
-into the client conversation. `MaxResponseBytes` caps the buffer at 16 MiB per
-attempt by default; exceeding the cap fails without a model retry.
+Non-streaming eligible attempts are fully buffered and validated. Streaming
+attempts inspect only their first SSE line: an upfront unavailable-tool error may
+be retried, but after a comment, heartbeat, reasoning, `reasoning_content`, or
+other SSE frame is forwarded the proxy never replays the request. This prevents
+duplicate or divergent visible reasoning. `MaxResponseBytes` caps only buffered
+non-streaming attempts.
 
-The first response bytes are delayed until validation. Allow client timeouts to
-cover up to two generations, including prefill. Responses without tools retain
-their normal streaming path. Request-side LoopGuard still runs, but the mid-turn
-wedge is bypassed for buffered recovery requests to avoid an extra unvalidated
-generation. Media observations are appended to successful responses only.
+The streaming raw-call filter forwards SSE comments, heartbeats, errors,
+`reasoning`, and `reasoning_content` immediately. It buffers answer `content` per
+choice until its terminal event so raw calls remain atomic and literal context can
+span arbitrary chunks. A malformed actual raw call after visible output ends with
+one `invalid_raw_tool_call` SSE error frame and `[DONE]`; it is not retried.
+Because the proxy does not retain a live stream to completion, a streaming retry
+is not finalized as a retry-success metric after its first forwarded frame.
+Request-side LoopGuard still runs, but the mid-turn wedge is bypassed for recovery
+requests. Media observations are appended to successful responses only.
 
 Raw-markup recognition remains a compatibility heuristic, not a security boundary
-or complete tool-argument schema validation. Literal protocol examples may still
-be treated as attempted calls. Recovery helps the model correct the response; it
-does not replace authoritative tool validation in the serving stack or client.
+or complete tool-argument schema validation. Fenced/inline code, quoted text and
+Markdown blockquotes are preserved as literal protocol examples. Recovery helps
+the model correct the response; it does not replace authoritative tool validation
+in the serving stack or client.
 
 ## Health And Logs
 

@@ -27,7 +27,8 @@ public static class RawToolCallCure
 
     public static int FindStart(string text)
     {
-        var positions = Starts.Select(s => text.IndexOf(s, StringComparison.Ordinal)).Where(i => i >= 0);
+        var protectedText = ProtectLiterals(text, out _);
+        var positions = Starts.Select(s => protectedText.IndexOf(s, StringComparison.Ordinal)).Where(i => i >= 0);
         return positions.DefaultIfEmpty(-1).Min();
     }
 
@@ -45,7 +46,8 @@ public static class RawToolCallCure
         calls = new JsonArray();
         var parsedCalls = calls;
         content = text;
-        var normalized = Normalize(text);
+        var protectedText = ProtectLiterals(text, out var literals);
+        var normalized = Normalize(protectedText);
         var blocks = Matches(normalized, @"<(?<tag>tool_calls|tool_call)>(?<body>.*?)</\k<tag>\s*>");
         if (blocks.Count == 0) return false;
         foreach (Match block in blocks)
@@ -91,7 +93,7 @@ public static class RawToolCallCure
         // Strip only validated blocks; retain surrounding assistant prose.
         foreach (Match block in blocks.Cast<Match>().Reverse()) normalized = normalized.Remove(block.Index, block.Length);
         if (FindStart(normalized) >= 0) return false;
-        content = normalized;
+        content = RestoreLiterals(normalized, literals);
         return calls.Count > 0;
 
         bool Add(string name, JsonObject args)
@@ -104,6 +106,149 @@ public static class RawToolCallCure
             });
             return true;
         }
+    }
+
+    // Keep example markup opaque before normalizing or looking for raw calls. This is
+    // deliberately a whole-response lexer: SSE chunks may split every delimiter.
+    private static string ProtectLiterals(string text, out List<string> literals)
+    {
+        literals = [];
+        var result = new System.Text.StringBuilder(text.Length);
+        for (var i = 0; i < text.Length;)
+        {
+            if (IsIndentedCode(text, i, out var quoteEnd) || IsBlockQuote(text, i, out quoteEnd) || IsFence(text, i, out quoteEnd) || IsInlineCode(text, i, out quoteEnd) || IsQuotedExample(text, i, out quoteEnd))
+            {
+                literals.Add(text[i..quoteEnd]);
+                result.Append('\u0001').Append(literals.Count - 1).Append('\u0002');
+                i = quoteEnd;
+                continue;
+            }
+
+            // Do not mistake quoted JSON argument values inside an actual call for
+            // prose examples. A malformed call remains visible for strict rejection.
+            if (Starts.Any(s => text.AsSpan(i).StartsWith(s, StringComparison.Ordinal)) && FindRawBlockEnd(text, i) is var rawEnd && rawEnd > i)
+            {
+                result.Append(text, i, rawEnd - i);
+                i = rawEnd;
+                continue;
+            }
+            result.Append(text[i++]);
+        }
+        return result.ToString();
+    }
+
+    private static string RestoreLiterals(string text, List<string> literals)
+    {
+        for (var i = 0; i < literals.Count; i++) text = text.Replace("\u0001" + i + "\u0002", literals[i], StringComparison.Ordinal);
+        return text;
+    }
+
+    private static bool IsBlockQuote(string text, int index, out int end)
+    {
+        end = index;
+        if (!AtLineStart(text, index, out var content) || content != index || text[index] != '>') return false;
+        end = LineEnd(text, index);
+        return true;
+    }
+
+    private static bool IsIndentedCode(string text, int index, out int end)
+    {
+        end = index;
+        if (index > 0 && text[index - 1] != '\n') return false;
+        var cursor = index;
+        var columns = 0;
+        while (cursor < text.Length && (text[cursor] == ' ' || text[cursor] == '\t'))
+        {
+            columns += text[cursor] == '\t' ? 4 - columns % 4 : 1;
+            cursor++;
+        }
+        if (columns < 4) return false;
+        end = LineEnd(text, index);
+        return true;
+    }
+
+    private static bool IsFence(string text, int index, out int end)
+    {
+        end = index;
+        if (!AtLineStart(text, index, out var content) || content != index || (text[index] != '`' && text[index] != '~')) return false;
+        var marker = text[index];
+        var count = 0;
+        while (index + count < text.Length && text[index + count] == marker) count++;
+        if (count < 3) return false;
+        var cursor = LineEnd(text, index);
+        while (cursor < text.Length)
+        {
+            var line = cursor;
+            if (AtLineStart(text, line, out var markerPosition) && markerPosition < text.Length && text[markerPosition] == marker)
+            {
+                var closing = 0;
+                while (markerPosition + closing < text.Length && text[markerPosition + closing] == marker) closing++;
+                var lineEnd = LineEnd(text, line);
+                if (closing >= count && text.AsSpan(markerPosition + closing, lineEnd - markerPosition - closing).Trim().Length == 0)
+                {
+                    end = lineEnd;
+                    return true;
+                }
+            }
+            cursor = LineEnd(text, cursor);
+        }
+        end = text.Length;
+        return true;
+    }
+
+    private static bool IsInlineCode(string text, int index, out int end)
+    {
+        end = index;
+        if (text[index] != '`') return false;
+        var count = 0;
+        while (index + count < text.Length && text[index + count] == '`') count++;
+        if (count >= 3 && AtLineStart(text, index, out var content) && content == index) return false;
+        var closing = -1;
+        for (var cursor = index + count; cursor < text.Length; cursor++)
+        {
+            if (text[cursor] != '`') continue;
+            var run = 0;
+            while (cursor + run < text.Length && text[cursor + run] == '`') run++;
+            if (run == count) { closing = cursor; break; }
+            cursor += run - 1;
+        }
+        end = closing < 0 ? text.Length : closing + count;
+        return true;
+    }
+
+    private static bool IsQuotedExample(string text, int index, out int end)
+    {
+        end = index;
+        if (text[index] is not ('\'' or '"') || (index > 0 && text[index - 1] == '\\')) return false;
+        var quote = text[index];
+        for (var cursor = index + 1; cursor < text.Length; cursor++)
+            if (text[cursor] == quote && text[cursor - 1] != '\\')
+            {
+                end = cursor + 1;
+                return Starts.Any(s => text.AsSpan(index + 1, cursor - index - 1).IndexOf(s, StringComparison.Ordinal) >= 0);
+            }
+        return false;
+    }
+
+    private static int FindRawBlockEnd(string text, int start)
+    {
+        var close = Regex.Match(text[start..], @"</(?:[|\uFF5C]DSML[|\uFF5C]\s*|DSML[:\s]+)?(?:calls|tool_calls|tool_call)\s*>", RegexOptions.Singleline, RegexTimeout);
+        return close.Success ? start + close.Index + close.Length : -1;
+    }
+
+    private static bool AtLineStart(string text, int index, out int content)
+    {
+        var line = index;
+        while (line > 0 && text[line - 1] != '\n') line--;
+        content = line;
+        while (content < text.Length && content - line < 3 && text[content] == ' ') content++;
+        return true;
+    }
+
+    private static int LineEnd(string text, int index)
+    {
+        var newline = text.IndexOf('\n', index);
+        return newline < 0 ? text.Length : newline + 1;
     }
 
     public static HashSet<string> AllowedNames(string request)
